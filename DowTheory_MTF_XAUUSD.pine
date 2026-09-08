@@ -1,0 +1,873 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+//  DOW THEORY MULTI-TIMEFRAME MARKET STRUCTURE  —  built for XAUUSD
+//
+//  Engine chain:  ATR-filtered swings → Dow classification (HH/HL/LH/LL)
+//                 → structure state machine → Break of Structure (BOS)
+//                 → two-stage reversal (WATCH → CONFIRMED) → liquidity sweeps
+//                 → multi-timeframe alignment → confidence score → LONG / SHORT
+//
+//  Non-repainting design:
+//    • Swings are confirmed pivots only (need "Swing Length" closed bars after them).
+//    • Higher-timeframe data is taken from CLOSED HTF bars ([1] + lookahead_on).
+//    • Signals are evaluated on bar close and never move once printed.
+// ══════════════════════════════════════════════════════════════════════════════
+indicator("Dow Theory MTF Structure [XAUUSD]", shorttitle = "DOW-MTF", overlay = true,
+     max_labels_count = 500, max_lines_count = 500)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 1. INPUTS
+// ──────────────────────────────────────────────────────────────────────────────
+string G_STRUCT = "Structure"
+string G_NOISE = "Noise Filter"
+string G_MTF = "Multi-Timeframe"
+string G_SIG = "Signals"
+string G_VIS = "Visualization"
+string G_FILT = "Filters"
+string G_SESS = "Sessions"
+string G_DASH = "Dashboard"
+
+// Structure ───────────────────────────────────────────────────────────────────
+swingLen    = input.int(5, "Swing Length (bars each side)", minval = 2, maxval = 50, group = G_STRUCT,
+     tooltip = "A pivot is confirmed only after this many bars close on each side of it. Nothing is assumed before confirmation.")
+atrLen      = input.int(14, "ATR Length", minval = 5, maxval = 200, group = G_STRUCT)
+minSwingATR = input.float(1.2, "Minimum Swing Distance (x ATR)", minval = 0, step = 0.1, group = G_STRUCT,
+     tooltip = "A pivot becomes a structural swing only if it is at least this far (in ATR) from the previous opposite swing. Smaller pivots are ignored.")
+dispATR     = input.float(0.3, "Minimum Structure Displacement (x ATR)", minval = 0, step = 0.05, group = G_STRUCT,
+     tooltip = "A swing must exceed the previous same-side swing by this much to count as HH/HL or LH/LL. Inside the band it is an EQUAL high/low and changes nothing.")
+breakThrATR = input.float(0.15, "BOS Break Threshold (x ATR)", minval = 0, step = 0.05, group = G_STRUCT,
+     tooltip = "Price must exceed the structure level by this ATR multiple for a Break of Structure to count.")
+confirmBars = input.int(1, "BOS Confirmation Candles", minval = 1, maxval = 5, group = G_STRUCT,
+     tooltip = "Consecutive candles that must satisfy the break condition before BOS is confirmed.")
+bosMode     = input.string("Close", "BOS Confirmation", options = ["Close", "Wick"], group = G_STRUCT,
+     tooltip = "Close = candle must close beyond the level (recommended). Wick = any touch beyond the level. Sweep detection only works in Close mode.")
+
+// Noise filter ────────────────────────────────────────────────────────────────
+useATRNoise  = input.bool(true, "Use ATR Noise Filter", group = G_NOISE,
+     tooltip = "Applies the ATR-based swing distance / displacement thresholds. Off = every confirmed pivot is structure (noisy).")
+minBarsSig   = input.int(20, "Minimum Bars Between Signals", minval = 0, maxval = 500, group = G_NOISE)
+useChop      = input.bool(true, "Chop / Range Detection", group = G_NOISE,
+     tooltip = "Blocks LONG/SHORT while the market is classified RANGING / CHOP.")
+chopWindow   = input.int(60, "Chop Lookback (bars)", minval = 20, maxval = 500, group = G_NOISE)
+chopFlips    = input.int(3, "Chop: Trend Flips In Lookback", minval = 2, maxval = 10, group = G_NOISE,
+     tooltip = "This many structure direction changes inside the lookback = chop.")
+chopRangeATR = input.float(2.0, "Chop: Max Structure Range (x ATR)", minval = 0.5, step = 0.25, group = G_NOISE,
+     tooltip = "If the active swing high to swing low range is smaller than this (in ATR) while ADX is weak, the market is treated as ranging.")
+useSweeps    = input.bool(true, "Liquidity Sweep / Failed Break Detection", group = G_NOISE)
+sweepWatch   = input.bool(true, "Sweep Triggers Reversal Watch", group = G_NOISE,
+     tooltip = "A sweep of the active structure level against the trend puts the timeframe into REVERSAL WATCH (stage 1).")
+
+// Multi-timeframe ─────────────────────────────────────────────────────────────
+tfHTF   = input.timeframe("240", "Higher Timeframe (HTF)", group = G_MTF)
+tfMTF   = input.timeframe("60",  "Intermediate Timeframe (MTF)", group = G_MTF)
+tfLTF   = input.timeframe("15",  "Trading Timeframe (LTF)", group = G_MTF)
+tfENTRY = input.timeframe("5",   "Entry Timeframe", group = G_MTF,
+     tooltip = "Signals are generated on the CHART timeframe. Set the chart to the entry timeframe (default 5M) so entry structure and signals match exactly.")
+requireMTF  = input.bool(true, "Continuation Signals Require MTF Not Opposed", group = G_MTF,
+     tooltip = "A continuation LONG is blocked while the intermediate timeframe is strictly BEARISH (and vice versa).")
+allowCtrRev = input.bool(true, "Allow Reversal Signals Against HTF", group = G_MTF,
+     tooltip = "Reversal signals may fire while the HTF still points the other way (they need a very high score to pass). Off = HTF must not be strictly opposed.")
+
+// Signals ─────────────────────────────────────────────────────────────────────
+minScore     = input.int(75, "Minimum Signal Score", options = [50, 60, 70, 75, 80, 85, 90], group = G_SIG)
+enableLong   = input.bool(true, "Enable LONG", group = G_SIG)
+enableShort  = input.bool(true, "Enable SHORT", group = G_SIG)
+enableRev    = input.bool(true, "Enable Reversal Signals", group = G_SIG)
+maxExtATR    = input.float(3.0, "Max Extension From Swing (x ATR)", minval = 0.5, step = 0.25, group = G_SIG,
+     tooltip = "No signal if price is further than this from the last opposite swing (chasing).")
+confirmClose = input.bool(true, "Evaluate Signals On Bar Close Only", group = G_SIG,
+     tooltip = "Keeps the realtime bar from flashing signals that vanish before the close.")
+
+// Visualization ───────────────────────────────────────────────────────────────
+showHH       = input.bool(true,  "Show HH", group = G_VIS, inline = "v1")
+showHL       = input.bool(true,  "Show HL", group = G_VIS, inline = "v1")
+showLH       = input.bool(true,  "Show LH", group = G_VIS, inline = "v1")
+showLL       = input.bool(true,  "Show LL", group = G_VIS, inline = "v1")
+showSwingPts = input.bool(false, "Swing Points (dots)", group = G_VIS, inline = "v2")
+showDevSwing = input.bool(true,  "Developing Swing", group = G_VIS, inline = "v2",
+     tooltip = "One small marker at the unconfirmed candidate swing. It moves until the pivot confirms; confirmed labels never move.")
+showZigZag   = input.bool(true,  "Structure Lines (HL→HH / LH→LL)", group = G_VIS, inline = "v3")
+showLevels   = input.bool(true,  "Show Active Structure Levels", group = G_VIS, inline = "v4")
+showPrevLvls = input.bool(false, "Show Previous Structure", group = G_VIS, inline = "v4")
+maxBosLvls   = input.int(6, "Maximum Structure Levels (kept BOS lines)", minval = 1, maxval = 40, group = G_VIS)
+showBOS      = input.bool(true,  "BOS Labels", group = G_VIS, inline = "v5")
+showSignals  = input.bool(true,  "Signal Labels", group = G_VIS, inline = "v5")
+showRevLbl   = input.bool(true,  "Reversal Labels", group = G_VIS, inline = "v5")
+showWatch    = input.bool(true,  "Reversal Watch Markers", group = G_VIS, inline = "v6")
+showSweepLbl = input.bool(true,  "Sweep / Failed Break Labels", group = G_VIS, inline = "v6")
+showScore    = input.bool(true,  "Show Confidence Score", group = G_VIS, inline = "v7")
+showWeak     = input.bool(false, "Show Below-Threshold Setups (tiny)", group = G_VIS, inline = "v7")
+showChopBg   = input.bool(true,  "Shade Chop Zones", group = G_VIS, inline = "v8")
+cBull        = input.color(#26a69a, "Bull", group = G_VIS, inline = "c")
+cBear        = input.color(#ef5350, "Bear", group = G_VIS, inline = "c")
+cNeut        = input.color(#9598a1, "Neutral", group = G_VIS, inline = "c")
+cWatch       = input.color(#ffb74d, "Watch", group = G_VIS, inline = "c")
+
+// Filters ─────────────────────────────────────────────────────────────────────
+useRSI     = input.bool(true, "Use RSI Filter", group = G_FILT, inline = "rsi")
+rsiLen     = input.int(14, "Len", minval = 2, group = G_FILT, inline = "rsi")
+rsiThr     = input.int(50, "Long > / Short <", minval = 30, maxval = 70, group = G_FILT, inline = "rsi")
+useADX     = input.bool(true, "Use ADX Filter", group = G_FILT, inline = "adx")
+adxLen     = input.int(14, "Len", minval = 2, group = G_FILT, inline = "adx")
+adxThr     = input.float(20, "Min ADX", minval = 5, maxval = 50, step = 1, group = G_FILT, inline = "adx")
+useATRVol  = input.bool(true, "Use ATR Volatility Filter", group = G_FILT, inline = "atr")
+atrSmaLen  = input.int(50, "Avg Len", minval = 5, group = G_FILT, inline = "atr")
+atrMinFac  = input.float(0.8, "Min ATR / Avg", minval = 0.1, maxval = 2, step = 0.05, group = G_FILT, inline = "atr",
+     tooltip = "ATR below this fraction of its average = compressed volatility (weak / ranging).")
+
+// Sessions ────────────────────────────────────────────────────────────────────
+useSessFilt = input.bool(false, "Use Session Filter", group = G_SESS)
+tradeAsia   = input.bool(false, "Asia", group = G_SESS, inline = "s1")
+tradeLdn    = input.bool(true,  "London", group = G_SESS, inline = "s1")
+tradeNY     = input.bool(true,  "New York", group = G_SESS, inline = "s1")
+sessAsia    = input.session("0000-0800", "Asia", group = G_SESS, inline = "s2")
+sessLdn     = input.session("0700-1600", "London", group = G_SESS, inline = "s2")
+sessNY      = input.session("1200-2100", "New York", group = G_SESS, inline = "s2")
+sessTZ      = input.string("UTC", "Session Timezone", group = G_SESS, tooltip = "IANA name, e.g. UTC, Europe/London, America/New_York.")
+
+// Dashboard ───────────────────────────────────────────────────────────────────
+showDash = input.bool(true, "Show Dashboard", group = G_DASH)
+dashPos  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = G_DASH)
+dashSize = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal"], group = G_DASH)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 2. UTILITY FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────────
+// "240" → "4H", "15" → "15M", "D" → "1D"
+f_tfLabel(string tf) =>
+    int sec = timeframe.in_seconds(tf)
+    string out = tf
+    if sec < 60
+        out := str.tostring(sec) + "s"
+    else if sec < 3600
+        out := str.tostring(sec / 60) + "M"
+    else if sec < 86400
+        out := str.tostring(sec / 3600) + "H"
+    else if sec < 604800
+        out := str.tostring(sec / 86400) + "D"
+    out
+
+f_stateText(int st) =>
+    switch st
+        1  => "BULLISH"
+        -1 => "BEARISH"
+        2  => "REV WATCH ▲"
+        -2 => "REV WATCH ▼"
+        => "NEUTRAL"
+
+f_stateColor(int st) =>
+    switch st
+        1  => cBull
+        -1 => cBear
+        2  => cWatch
+        -2 => cWatch
+        => cNeut
+
+// Underlying trend direction of a state (watch states keep their trend)
+f_dirOf(int st) =>
+    st == 1 or st == -2 ? 1 : st == -1 or st == 2 ? -1 : 0
+
+f_structText(int ht, int lt) =>
+    string h = ht == 1 ? "HH" : ht == -1 ? "LH" : ht == 2 ? "EQH" : "–"
+    string l = lt == 1 ? "HL" : lt == -1 ? "LL" : lt == 2 ? "EQL" : "–"
+    h + " / " + l
+
+f_inSession(string sess) =>
+    not na(time(timeframe.period, sess, sessTZ))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 3–8. STRUCTURE ENGINE
+//      Swing detection → Dow classification → state machine → BOS → reversal → sweeps
+//      Pure calculation (no drawings) so the same function runs inside request.security().
+//
+//      State codes:  1 BULLISH   -1 BEARISH   0 NEUTRAL
+//                    2 REVERSAL_BULLISH  (bearish structure, bullish reversal watch)
+//                   -2 REVERSAL_BEARISH  (bullish structure, bearish reversal watch)
+//      Swing types:  hiType 1 = HH, -1 = LH, 2 = EQH, 0 = none yet
+//                    loType 1 = HL, -1 = LL, 2 = EQL, 0 = none yet
+// ──────────────────────────────────────────────────────────────────────────────
+f_engine() =>
+    float atr  = ta.atr(atrLen)
+    float ph   = ta.pivothigh(high, swingLen, swingLen)
+    float pl   = ta.pivotlow(low, swingLen, swingLen)
+    int   pBar = bar_index - swingLen
+
+    // persistent structure memory
+    var float sh        = na        // active (last confirmed significant) swing high
+    var int   shBar     = na
+    var float shPrev    = na        // previous significant swing high
+    var int   shPrevBar = na
+    var float sl        = na        // active swing low
+    var int   slBar     = na
+    var float slPrev    = na
+    var int   slPrevBar = na
+    var int   hiType    = 0
+    var int   loType    = 0
+    var int   lastDir   = 0         // 1 = last confirmed swing is a high, -1 = a low
+    var bool  shBroken  = false
+    var bool  slBroken  = false
+    var bool  shSwept   = false
+    var bool  slSwept   = false
+    var int   aboveCnt  = 0
+    var int   belowCnt  = 0
+    var int   state     = 0
+    var bool  evDow     = false     // reversal evidence: counter-trend Dow point (HL in bear / LH in bull)
+    var bool  evSwp     = false     // reversal evidence: liquidity sweep of the active level
+    var int   lastBullBOSBar = na
+    var int   lastBearBOSBar = na
+    var int   lastRevBullBar = na
+    var int   lastRevBearBar = na
+
+    float thrSwing = useATRNoise ? minSwingATR * atr : 0.0
+    float thrDisp  = useATRNoise ? dispATR * atr : 0.0
+    int   hiEvt    = 0              // 1 = new swing high, 2 = active swing high extended higher
+    int   loEvt    = 0              // 1 = new swing low,  2 = active swing low extended lower
+
+    // ── 3. swing detection with ATR significance + alternation ──
+    if not na(ph)
+        if lastDir == 1
+            // no significant low since the last high → keep the higher high (same swing, refined)
+            if ph > sh
+                sh       := ph
+                shBar    := pBar
+                hiType   := na(shPrev) ? 0 : ph > shPrev + thrDisp ? 1 : ph < shPrev - thrDisp ? -1 : 2
+                shBroken := false
+                shSwept  := false
+                aboveCnt := 0
+                hiEvt    := 2
+        else if na(sl) or ph - sl >= thrSwing
+            shPrev    := sh
+            shPrevBar := shBar
+            sh        := ph
+            shBar     := pBar
+            hiType    := na(shPrev) ? 0 : ph > shPrev + thrDisp ? 1 : ph < shPrev - thrDisp ? -1 : 2
+            lastDir   := 1
+            shBroken  := false
+            shSwept   := false
+            aboveCnt  := 0
+            hiEvt     := 1
+
+    if not na(pl)
+        if lastDir == -1
+            if pl < sl
+                sl       := pl
+                slBar    := pBar
+                loType   := na(slPrev) ? 0 : pl > slPrev + thrDisp ? 1 : pl < slPrev - thrDisp ? -1 : 2
+                slBroken := false
+                slSwept  := false
+                belowCnt := 0
+                loEvt    := 2
+        else if na(sh) or sh - pl >= thrSwing
+            slPrev    := sl
+            slPrevBar := slBar
+            sl        := pl
+            slBar     := pBar
+            loType    := na(slPrev) ? 0 : pl > slPrev + thrDisp ? 1 : pl < slPrev - thrDisp ? -1 : 2
+            lastDir   := -1
+            slBroken  := false
+            slSwept   := false
+            belowCnt  := 0
+            loEvt     := 1
+
+    // ── 4. Dow classification events ──
+    bool newHH  = hiEvt > 0 and hiType == 1
+    bool newLH  = hiEvt > 0 and hiType == -1
+    bool newEQH = hiEvt > 0 and hiType == 2
+    bool newHL  = loEvt > 0 and loType == 1
+    bool newLL  = loEvt > 0 and loType == -1
+    bool newEQL = loEvt > 0 and loType == 2
+
+    // ── 5. market structure state machine – Dow events (stage-1 reversal evidence) ──
+    int prevState = state
+    if newHL
+        if state == -1
+            state := 2
+            evDow := true
+        else if state == 2
+            evDow := true
+    if newLH
+        if state == 1
+            state := -2
+            evDow := true
+        else if state == -2
+            evDow := true
+    if newLL
+        if state == 2                   // bullish watch failed – bearish trend resumed
+            state := -1
+            evDow := false
+            evSwp := false
+        else if state == 1              // low taken without a confirmed BOS – warning
+            state := -2
+            evDow := true
+        else if state == -2
+            evDow := true
+    if newHH
+        if state == -2                  // bearish watch failed – bullish trend resumed
+            state := 1
+            evDow := false
+            evSwp := false
+        else if state == -1
+            state := 2
+            evDow := true
+        else if state == 2
+            evDow := true
+
+    // ── 6. break of structure (levels after this bar's pivot update) ──
+    float thrBrk = breakThrATR * atr
+    bool  upCond = not na(sh) and (bosMode == "Close" ? close > sh + thrBrk : high > sh + thrBrk)
+    bool  dnCond = not na(sl) and (bosMode == "Close" ? close < sl - thrBrk : low < sl - thrBrk)
+    aboveCnt := upCond ? aboveCnt + 1 : 0
+    belowCnt := dnCond ? belowCnt + 1 : 0
+    bool bullBOS = not na(sh) and not shBroken and aboveCnt >= confirmBars
+    bool bearBOS = not na(sl) and not slBroken and belowCnt >= confirmBars
+
+    // ── 8. liquidity sweeps / failed breaks (wick beyond the level, close back inside) ──
+    bool sweepHigh = useSweeps and bosMode == "Close" and not na(sh) and not shBroken and not shSwept and high > sh and close < sh
+    bool sweepLow  = useSweeps and bosMode == "Close" and not na(sl) and not slBroken and not slSwept and low < sl and close > sl
+    if sweepLow
+        slSwept := true
+        if state == -1 or state == 2
+            evSwp := true
+            if sweepWatch
+                state := 2
+    if sweepHigh
+        shSwept := true
+        if state == 1 or state == -2
+            evSwp := true
+            if sweepWatch
+                state := -2
+
+    // ── 7. BOS resolves the state: continuation, or stage-2 CONFIRMED reversal ──
+    bool revBull = false
+    bool revBear = false
+    bool rEvDow  = false
+    bool rEvSwp  = false
+    if bullBOS
+        shBroken       := true
+        lastBullBOSBar := bar_index
+        if state == -1 or state == 2
+            revBull        := true
+            rEvDow         := evDow
+            rEvSwp         := evSwp
+            lastRevBullBar := bar_index
+        state := 1
+        evDow := false
+        evSwp := false
+    if bearBOS
+        slBroken       := true
+        lastBearBOSBar := bar_index
+        if state == 1 or state == -2
+            revBear        := true
+            rEvDow         := evDow
+            rEvSwp         := evSwp
+            lastRevBearBar := bar_index
+        state := -1
+        evDow := false
+        evSwp := false
+
+    int bsBullBOS = na(lastBullBOSBar) ? 100000 : bar_index - lastBullBOSBar
+    int bsBearBOS = na(lastBearBOSBar) ? 100000 : bar_index - lastBearBOSBar
+    int bsRevBull = na(lastRevBullBar) ? 100000 : bar_index - lastRevBullBar
+    int bsRevBear = na(lastRevBearBar) ? 100000 : bar_index - lastRevBearBar
+
+    [state, prevState, hiType, loType, hiEvt, loEvt, sh, shBar, sl, slBar, shPrev, shPrevBar, slPrev, slPrevBar,
+      bullBOS, bearBOS, revBull, revBear, sweepLow, sweepHigh, shBroken, slBroken, lastDir, rEvDow, rEvSwp,
+      bsBullBOS, bsBearBOS, bsRevBull, bsRevBear, atr, newEQH or newEQL]
+
+// Closed-bar snapshot for request.security(): expression[1] + lookahead_on returns the
+// value of the last COMPLETED bar of the requested timeframe → identical on history and realtime.
+f_secEngine() =>
+    [st, _ps, ht, lt, _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u,
+      bsBB, bsSB, bsRB, bsRS, _v, _w] = f_engine()
+    [st[1], ht[1], lt[1], bsBB[1], bsSB[1], bsRB[1], bsRS[1]]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 9. CHART-TIMEFRAME ENGINE  (signals and drawings live here – set chart = entry TF)
+// ──────────────────────────────────────────────────────────────────────────────
+[cState, cPrevState, cHiType, cLoType, cHiEvt, cLoEvt, cSH, cSHBar, cSL, cSLBar, cSHPrev, cSHPrevBar, cSLPrev, cSLPrevBar,
+  cBullBOS, cBearBOS, cRevBull, cRevBear, cSweepLow, cSweepHigh, cSHBroken, cSLBroken, cLastDir, cREvDow, cREvSwp,
+  cBsBullBOS, cBsBearBOS, cBsRevBull, cBsRevBear, cATR, cEqEvt] = f_engine()
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 10. MULTI-TIMEFRAME CALCULATIONS  (exactly four requests, closed-bar data only)
+// ──────────────────────────────────────────────────────────────────────────────
+[hSt0, hHt0, hLt0, hBB0, hSB0, hRB0, hRS0] = request.security(syminfo.tickerid, tfHTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
+[mSt0, mHt0, mLt0, mBB0, mSB0, mRB0, mRS0] = request.security(syminfo.tickerid, tfMTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
+[lSt0, lHt0, lLt0, lBB0, lSB0, lRB0, lRS0] = request.security(syminfo.tickerid, tfLTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
+[eSt0, eHt0, eLt0, eBB0, eSB0, eRB0, eRS0] = request.security(syminfo.tickerid, tfENTRY, f_secEngine(), lookahead = barmerge.lookahead_on)
+
+// A timeframe equal to the chart uses the live chart engine (no closed-bar offset needed)
+f_pick(string tf, int secVal, int localVal) =>
+    tf == timeframe.period ? localVal : nz(secVal)
+f_pickN(string tf, int secVal, int localVal) =>
+    tf == timeframe.period ? localVal : nz(secVal, 100000)
+
+int hSt = f_pick(tfHTF, hSt0, cState)
+int hHt = f_pick(tfHTF, hHt0, cHiType)
+int hLt = f_pick(tfHTF, hLt0, cLoType)
+int hBB = f_pickN(tfHTF, hBB0, cBsBullBOS)
+int hSB = f_pickN(tfHTF, hSB0, cBsBearBOS)
+int mSt = f_pick(tfMTF, mSt0, cState)
+int mHt = f_pick(tfMTF, mHt0, cHiType)
+int mLt = f_pick(tfMTF, mLt0, cLoType)
+int mBB = f_pickN(tfMTF, mBB0, cBsBullBOS)
+int mSB = f_pickN(tfMTF, mSB0, cBsBearBOS)
+int lSt = f_pick(tfLTF, lSt0, cState)
+int lHt = f_pick(tfLTF, lHt0, cHiType)
+int lLt = f_pick(tfLTF, lLt0, cLoType)
+int lBB = f_pickN(tfLTF, lBB0, cBsBullBOS)
+int lSB = f_pickN(tfLTF, lSB0, cBsBearBOS)
+int eSt = f_pick(tfENTRY, eSt0, cState)
+int eHt = f_pick(tfENTRY, eHt0, cHiType)
+int eLt = f_pick(tfENTRY, eLt0, cLoType)
+int eBB = f_pickN(tfENTRY, eBB0, cBsBullBOS)
+int eSB = f_pickN(tfENTRY, eSB0, cBsBearBOS)
+bool chartIsEntry = tfENTRY == timeframe.period
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 11. FILTERS: momentum, volatility, sessions, chop  (secondary – never the trigger)
+// ──────────────────────────────────────────────────────────────────────────────
+float rsi = ta.rsi(close, rsiLen)
+[_dip, _dim, adx] = ta.dmi(adxLen, adxLen)
+float atrAvg     = ta.sma(cATR, atrSmaLen)
+bool  atrOK      = not useATRVol or cATR >= atrAvg * atrMinFac
+bool  adxOK      = not useADX or adx >= adxThr
+bool  rsiLongOK  = not useRSI or rsi > rsiThr
+bool  rsiShortOK = not useRSI or rsi < 100 - rsiThr
+
+bool   inAsia   = f_inSession(sessAsia)
+bool   inLdn    = f_inSession(sessLdn)
+bool   inNY     = f_inSession(sessNY)
+string sessName = inLdn and inNY ? "LDN+NY" : inLdn ? "LONDON" : inNY ? "NEW YORK" : inAsia ? "ASIA" : "OFF"
+bool   sessOK   = not useSessFilt or (tradeAsia and inAsia) or (tradeLdn and inLdn) or (tradeNY and inNY)
+
+// Range / chop: structure flipping, small swing range, compressed ATR, weak ADX, equal highs/lows
+int   cDir     = f_dirOf(cState)
+bool  flipEvt  = cDir != 0 and nz(cDir[1]) != 0 and cDir != nz(cDir[1])
+int   flips    = int(math.sum(flipEvt ? 1 : 0, chopWindow))
+int   eqCount  = int(math.sum(cEqEvt ? 1 : 0, chopWindow))
+float rangeATR = not na(cSH) and not na(cSL) and cATR > 0 ? math.abs(cSH - cSL) / cATR : 99.0
+bool  weakADX  = adx < adxThr
+bool  atrComp  = cATR < atrAvg * atrMinFac
+bool  chop     = useChop and (flips >= chopFlips or (weakADX and (rangeATR < chopRangeATR or atrComp or eqCount >= 2)))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 12. MULTI-TIMEFRAME BIAS
+// ──────────────────────────────────────────────────────────────────────────────
+bool allBull = hSt == 1 and mSt == 1 and lSt == 1 and eSt == 1
+bool allBear = hSt == -1 and mSt == -1 and lSt == -1 and eSt == -1
+
+f_bias() =>
+    string t = "NEUTRAL"
+    int    d = 0
+    if allBull
+        t := "STRONG BULLISH"
+        d := 2
+    else if allBear
+        t := "STRONG BEARISH"
+        d := -2
+    else if hSt == 1 and mSt == 1
+        t := lSt == -1 or eSt == -1 or lSt == 2 or eSt == 2 ? "BULLISH — PULLBACK" : "BULLISH"
+        d := 1
+    else if hSt == -1 and mSt == -1
+        t := lSt == 1 or eSt == 1 or lSt == -2 or eSt == -2 ? "BEARISH — PULLBACK" : "BEARISH"
+        d := -1
+    else if hSt == 2 or mSt == 2
+        t := "REVERSAL DEVELOPING ▲"
+    else if hSt == -2 or mSt == -2
+        t := "REVERSAL DEVELOPING ▼"
+    else if (hSt == 1 and mSt == -1) or (hSt == -1 and mSt == 1)
+        t := "MIXED / CONFLICT"
+    else if f_dirOf(hSt) == 1
+        t := "BULLISH (HTF)"
+        d := 1
+    else if f_dirOf(hSt) == -1
+        t := "BEARISH (HTF)"
+        d := -1
+    [t, d]
+
+[biasText, biasDir] = f_bias()
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 13. CONFIDENCE SCORE (0–100)
+//     Dow structure 25 · HTF alignment 25 · BOS 15 · Volatility 10 · Momentum 10 · Reversal 10 · Noise 5
+// ──────────────────────────────────────────────────────────────────────────────
+f_alignPts(int st, int dir, float w) =>
+    st == dir ? w : st == 2 * dir ? w * 0.5 : st == -2 * dir ? w * 0.6 : st == 0 ? w * 0.35 : 0.0
+
+f_score(int dir, bool isRev, bool evDow, bool evSwp) =>
+    // 1. Dow structure – continuation: confirmed HH+HL (or LH+LL) sequence; reversal: quality of stage-1 evidence
+    float sDow = 0.0
+    if isRev
+        sDow := 10 + (evDow ? 10 : 0) + (evSwp ? 5 : 0)
+    else
+        int q = dir == 1 ? (cHiType == 1 ? 1 : 0) + (cLoType == 1 ? 1 : 0) : (cHiType == -1 ? 1 : 0) + (cLoType == -1 ? 1 : 0)
+        sDow := q == 2 ? 25 : q == 1 ? 17 : 10
+    // 2. HTF alignment
+    float sHTF = f_alignPts(hSt, dir, 12) + f_alignPts(mSt, dir, 8) + f_alignPts(lSt, dir, 5)
+    // 3. BOS confirmation – displacement beyond the broken level
+    float lvl  = dir == 1 ? cSH : cSL
+    float disp = cATR > 0 and not na(lvl) ? (dir == 1 ? close - lvl : lvl - close) / cATR : 0.0
+    float sBOS = bosMode == "Wick" ? 10 : disp >= 0.5 ? 15 : 10
+    // 4. volatility – ATR not compressed, price not extended from the opposite swing
+    float opp  = dir == 1 ? cSL : cSH
+    float ext  = cATR > 0 and not na(opp) ? (dir == 1 ? close - opp : opp - close) / cATR : 0.0
+    float sVol = (atrOK ? 5 : 0) + (ext <= maxExtATR * 0.6 ? 5 : 2)
+    // 5. momentum (disabled filters count as neutral = full points)
+    float sMom = ((dir == 1 ? rsiLongOK : rsiShortOK) ? 5 : 0) + (adxOK ? 5 : 0)
+    // 6. reversal – reversal: stage-1 evidence existed; continuation: no timeframe warns against the trade
+    bool  oppWatch = hSt == -2 * dir or mSt == -2 * dir or lSt == -2 * dir
+    float sRev = isRev ? (evDow or evSwp ? 10 : 5) : (oppWatch ? 0 : 10)
+    // 7. noise – structure has not been flip-flopping (bars since the previous BOS the other way)
+    int   bsRef  = isRev ? (dir == 1 ? cBsBullBOS[1] : cBsBearBOS[1]) + 1 : (dir == 1 ? cBsBearBOS : cBsBullBOS)
+    float sNoise = bsRef >= 2 * minBarsSig ? 5 : 0
+    int total = int(math.round(sDow + sHTF + sBOS + sVol + sMom + sRev + sNoise))
+    string bd = "Dow " + str.tostring(sDow, "#") + " | HTF " + str.tostring(sHTF, "#.#") + " | BOS " + str.tostring(sBOS, "#") +
+         " | Vol " + str.tostring(sVol, "#") + " | Mom " + str.tostring(sMom, "#") + " | Rev " + str.tostring(sRev, "#") + " | Noise " + str.tostring(sNoise, "#")
+    [total, bd]
+
+f_strength(int s) =>
+    s >= 85 ? "VERY STRONG" : s >= 70 ? "STRONG" : s >= 50 ? "MODERATE" : "WEAK"
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 14. SIGNAL ENGINE
+// ──────────────────────────────────────────────────────────────────────────────
+var int lastSigBar = na
+bool cooldownOK = na(lastSigBar) or bar_index - lastSigBar >= minBarsSig
+bool barOK      = not confirmClose or barstate.isconfirmed
+bool gateCommon = barOK and sessOK and not chop and cooldownOK
+
+// candidate events on the chart timeframe
+bool candLongCont  = enableLong  and cBullBOS and not cRevBull and cState == 1
+bool candLongRev   = enableLong  and enableRev and cRevBull
+bool candShortCont = enableShort and cBearBOS and not cRevBear and cState == -1
+bool candShortRev  = enableShort and enableRev and cRevBear
+
+// higher-timeframe conflict gates
+bool htfOKLong  = hSt != -1 and (not requireMTF or mSt != -1)
+bool htfOKShort = hSt != 1 and (not requireMTF or mSt != 1)
+bool revOKLong  = allowCtrRev or hSt != -1
+bool revOKShort = allowCtrRev or hSt != 1
+
+// extension gate (don't chase)
+float extLong  = cATR > 0 and not na(cSL) ? (close - cSL) / cATR : 0.0
+float extShort = cATR > 0 and not na(cSH) ? (cSH - close) / cATR : 0.0
+
+[scLC, bdLC] = f_score(1, false, false, false)
+[scLR, bdLR] = f_score(1, true, cREvDow, cREvSwp)
+[scSC, bdSC] = f_score(-1, false, false, false)
+[scSR, bdSR] = f_score(-1, true, cREvDow, cREvSwp)
+
+bool longCont  = gateCommon and candLongCont  and htfOKLong  and extLong  <= maxExtATR and scLC >= minScore
+bool longRev   = gateCommon and candLongRev   and revOKLong  and extLong  <= maxExtATR and scLR >= minScore
+bool shortCont = gateCommon and candShortCont and htfOKShort and extShort <= maxExtATR and scSC >= minScore
+bool shortRev  = gateCommon and candShortRev  and revOKShort and extShort <= maxExtATR and scSR >= minScore
+bool anySig    = longCont or longRev or shortCont or shortRev
+
+// setups that passed every gate but not the score (optional tiny markers)
+bool weakLong  = gateCommon and ((candLongCont and htfOKLong) or (candLongRev and revOKLong)) and extLong <= maxExtATR and not (longCont or longRev)
+bool weakShort = gateCommon and ((candShortCont and htfOKShort) or (candShortRev and revOKShort)) and extShort <= maxExtATR and not (shortCont or shortRev)
+int  weakScore = weakLong ? (candLongRev ? scLR : scLC) : weakShort ? (candShortRev ? scSR : scSC) : 0
+
+int    sigScore = longCont ? scLC : longRev ? scLR : shortCont ? scSC : shortRev ? scSR : 0
+string sigBreak = longCont ? bdLC : longRev ? bdLR : shortCont ? bdSC : shortRev ? bdSR : ""
+string sigType  = longCont ? "LONG" : longRev ? "LONG REVERSAL" : shortCont ? "SHORT" : shortRev ? "SHORT REVERSAL" : ""
+
+var string lastSigText  = "—"
+var int    lastSigScore = 0
+if anySig
+    lastSigBar   := bar_index
+    lastSigText  := sigType
+    lastSigScore := sigScore
+
+// stage-1 transitions and alignment events (for markers and alerts)
+bool watchBull   = cState == 2 and cPrevState != 2
+bool watchBear   = cState == -2 and cPrevState != -2
+bool strongBullA = allBull and not allBull[1]
+bool strongBearA = allBear and not allBear[1]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 15. CHART VISUALIZATION
+//     Confirmed swings → labels + structure lines (an extended swing MOVES its own
+//     label/line, it never adds a new one). Signals/BOS labels are created once and
+//     never touched again. Active levels / developing swing are single reusable objects.
+// ──────────────────────────────────────────────────────────────────────────────
+f_swingInfo(int t, bool isHigh) =>
+    string txt = isHigh ? (t == 1 ? "HH" : t == -1 ? "LH" : t == 2 ? "EQH" : "H") : (t == 1 ? "HL" : t == -1 ? "LL" : t == 2 ? "EQL" : "L")
+    bool   typeOn = isHigh ? (t == 1 ? showHH : t == -1 ? showLH : showHH or showLH) : (t == 1 ? showHL : t == -1 ? showLL : showHL or showLL)
+    color  col = t == 1 ? cBull : t == -1 ? cBear : cNeut
+    bool   vis = typeOn or showSwingPts
+    [typeOn ? txt : "•", col, vis]
+
+var label lastHiLbl = na
+var label lastLoLbl = na
+var line  lastZZ    = na
+
+// ── confirmed swing highs ──
+if cHiEvt > 0
+    [txtH, colH, visH] = f_swingInfo(cHiType, true)
+    if cHiEvt == 1
+        if showZigZag and not na(cSLBar)
+            lastZZ := line.new(cSLBar, cSL, cSHBar, cSH, color = color.new(colH, 25), width = 1)
+        lastHiLbl := visH ? label.new(cSHBar, cSH, txtH, style = label.style_label_down, color = color.new(colH, 85), textcolor = colH, size = size.small) : label(na)
+    else
+        if not na(lastZZ) and cLastDir == 1
+            line.set_xy2(lastZZ, cSHBar, cSH)
+            line.set_color(lastZZ, color.new(colH, 25))
+        if not na(lastHiLbl)
+            if visH
+                label.set_xy(lastHiLbl, cSHBar, cSH)
+                label.set_text(lastHiLbl, txtH)
+                label.set_textcolor(lastHiLbl, colH)
+                label.set_color(lastHiLbl, color.new(colH, 85))
+            else
+                label.delete(lastHiLbl)
+                lastHiLbl := label(na)
+        else if visH
+            lastHiLbl := label.new(cSHBar, cSH, txtH, style = label.style_label_down, color = color.new(colH, 85), textcolor = colH, size = size.small)
+
+// ── confirmed swing lows ──
+if cLoEvt > 0
+    [txtL, colL, visL] = f_swingInfo(cLoType, false)
+    if cLoEvt == 1
+        if showZigZag and not na(cSHBar)
+            lastZZ := line.new(cSHBar, cSH, cSLBar, cSL, color = color.new(colL, 25), width = 1)
+        lastLoLbl := visL ? label.new(cSLBar, cSL, txtL, style = label.style_label_up, color = color.new(colL, 85), textcolor = colL, size = size.small) : label(na)
+    else
+        if not na(lastZZ) and cLastDir == -1
+            line.set_xy2(lastZZ, cSLBar, cSL)
+            line.set_color(lastZZ, color.new(colL, 25))
+        if not na(lastLoLbl)
+            if visL
+                label.set_xy(lastLoLbl, cSLBar, cSL)
+                label.set_text(lastLoLbl, txtL)
+                label.set_textcolor(lastLoLbl, colL)
+                label.set_color(lastLoLbl, color.new(colL, 85))
+            else
+                label.delete(lastLoLbl)
+                lastLoLbl := label(na)
+        else if visL
+            lastLoLbl := label.new(cSLBar, cSL, txtL, style = label.style_label_up, color = color.new(colL, 85), textcolor = colL, size = size.small)
+
+// ── break of structure lines (kept to "Maximum Structure Levels") ──
+var line[]  bosLines  = array.new<line>()
+var label[] bosLabels = array.new<label>()
+f_addBos(int x1, float y, bool isBull, bool isRev) =>
+    color  col = isBull ? cBull : cBear
+    int    xm  = int(math.round((x1 + bar_index) / 2.0))
+    line   ln  = line.new(x1, y, bar_index, y, color = color.new(col, 20), style = line.style_dashed, width = 1)
+    string t   = (isRev ? "CHoCH " : "BOS ") + (isBull ? "▲" : "▼")
+    label  lb  = label.new(xm, y, t, style = isBull ? label.style_label_down : label.style_label_up, color = color.new(col, 80), textcolor = col, size = size.tiny)
+    array.push(bosLines, ln)
+    array.push(bosLabels, lb)
+    if array.size(bosLines) > maxBosLvls
+        line.delete(array.shift(bosLines))
+        label.delete(array.shift(bosLabels))
+
+if showBOS and cBullBOS
+    f_addBos(cSHBar, cSH, true, cRevBull)
+if showBOS and cBearBOS
+    f_addBos(cSLBar, cSL, false, cRevBear)
+
+// ── sweeps / failed breaks (context decides the wording) ──
+if showSweepLbl and cSweepHigh and not watchBear
+    bool bullCtx = cPrevState == 1 or cPrevState == -2
+    label.new(bar_index, high, bullCtx ? "FAILED BULL BREAK" : "BEARISH SWEEP", style = label.style_label_down, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
+if showSweepLbl and cSweepLow and not watchBull
+    bool bearCtx = cPrevState == -1 or cPrevState == 2
+    label.new(bar_index, low, bearCtx ? "BULLISH SWEEP" : "FAILED BEAR BREAK", style = label.style_label_up, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
+
+// ── stage-1 reversal watch markers ──
+if showWatch and watchBull
+    label.new(bar_index, low, "REV WATCH ▲" + (cSweepLow ? " · SWEEP" : cLoEvt > 0 ? " · HL" : ""), style = label.style_label_up, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bearish structure showing bullish reversal evidence (HL and/or sweep). No trade yet – wait for the break of the last LH.")
+if showWatch and watchBear
+    label.new(bar_index, high, "REV WATCH ▼" + (cSweepHigh ? " · SWEEP" : cHiEvt > 0 ? " · LH" : ""), style = label.style_label_down, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bullish structure showing bearish reversal evidence (LH and/or sweep). No trade yet – wait for the break of the last HL.")
+
+// ── signals (created once, never moved) ──
+if showSignals and (longCont or shortCont)
+    string t = (longCont ? "▲ LONG" : "▼ SHORT") + (showScore ? "\n" + str.tostring(sigScore) : "")
+    label.new(bar_index, longCont ? low : high, t, style = longCont ? label.style_label_up : label.style_label_down,
+         color = longCont ? cBull : cBear, textcolor = color.white, size = size.normal, tooltip = f_strength(sigScore) + " (" + str.tostring(sigScore) + ")\n" + sigBreak)
+if showRevLbl and (longRev or shortRev)
+    string t = (longRev ? "↗ LONG REVERSAL" : "↘ SHORT REVERSAL") + (showScore ? "\n" + str.tostring(sigScore) : "")
+    label.new(bar_index, longRev ? low : high, t, style = longRev ? label.style_label_up : label.style_label_down,
+         color = longRev ? cBull : cBear, textcolor = color.white, size = size.normal, tooltip = f_strength(sigScore) + " (" + str.tostring(sigScore) + ")\n" + sigBreak)
+if showWeak and (weakLong or weakShort)
+    label.new(bar_index, weakLong ? low : high, str.tostring(weakScore), style = weakLong ? label.style_label_up : label.style_label_down,
+         color = color.new(cNeut, 70), textcolor = color.white, size = size.tiny, tooltip = "Setup below the minimum score")
+
+// ── developing (unconfirmed) swing candidate: one reusable marker ──
+float hiN    = ta.highest(high, swingLen)
+int   hiNoff = ta.highestbars(high, swingLen)
+float loN    = ta.lowest(low, swingLen)
+int   loNoff = ta.lowestbars(low, swingLen)
+var float devPx     = na
+var int   devBar    = na
+var bool  devIsHigh = false
+if cLoEvt > 0
+    devIsHigh := true
+    devPx     := hiN
+    devBar    := bar_index + hiNoff
+else if cHiEvt > 0
+    devIsHigh := false
+    devPx     := loN
+    devBar    := bar_index + loNoff
+else if devIsHigh and high > devPx
+    devPx  := high
+    devBar := bar_index
+else if not devIsHigh and low < devPx
+    devPx  := low
+    devBar := bar_index
+
+// ── reusable objects updated on the last bar only ──
+var line  hiLvl     = na
+var line  loLvl     = na
+var line  hiPrevLvl = na
+var line  loPrevLvl = na
+var label hiLvlLbl  = na
+var label loLvlLbl  = na
+var label devLbl    = na
+
+if barstate.islast
+    if showLevels
+        if na(hiLvl)
+            hiLvl    := line.new(bar_index, close, bar_index, close, width = 1)
+            loLvl    := line.new(bar_index, close, bar_index, close, width = 1)
+            hiLvlLbl := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+            loLvlLbl := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+        if not na(cSH)
+            line.set_xy1(hiLvl, cSHBar, cSH)
+            line.set_xy2(hiLvl, bar_index, cSH)
+            line.set_style(hiLvl, cSHBroken ? line.style_dotted : line.style_solid)
+            line.set_color(hiLvl, color.new(cBear, cSHBroken ? 65 : 15))
+            label.set_xy(hiLvlLbl, bar_index, cSH)
+            label.set_text(hiLvlLbl, (cHiType == 1 ? "HH" : cHiType == -1 ? "LH" : cHiType == 2 ? "EQH" : "H") + (cSHBroken ? " (broken)" : " LEVEL"))
+            label.set_textcolor(hiLvlLbl, color.new(cBear, cSHBroken ? 40 : 0))
+        if not na(cSL)
+            line.set_xy1(loLvl, cSLBar, cSL)
+            line.set_xy2(loLvl, bar_index, cSL)
+            line.set_style(loLvl, cSLBroken ? line.style_dotted : line.style_solid)
+            line.set_color(loLvl, color.new(cBull, cSLBroken ? 65 : 15))
+            label.set_xy(loLvlLbl, bar_index, cSL)
+            label.set_text(loLvlLbl, (cLoType == 1 ? "HL" : cLoType == -1 ? "LL" : cLoType == 2 ? "EQL" : "L") + (cSLBroken ? " (broken)" : " LEVEL"))
+            label.set_textcolor(loLvlLbl, color.new(cBull, cSLBroken ? 40 : 0))
+    if showPrevLvls
+        if na(hiPrevLvl)
+            hiPrevLvl := line.new(bar_index, close, bar_index, close, style = line.style_dashed, width = 1)
+            loPrevLvl := line.new(bar_index, close, bar_index, close, style = line.style_dashed, width = 1)
+        if not na(cSHPrev)
+            line.set_xy1(hiPrevLvl, cSHPrevBar, cSHPrev)
+            line.set_xy2(hiPrevLvl, bar_index, cSHPrev)
+            line.set_color(hiPrevLvl, color.new(cBear, 70))
+        if not na(cSLPrev)
+            line.set_xy1(loPrevLvl, cSLPrevBar, cSLPrev)
+            line.set_xy2(loPrevLvl, bar_index, cSLPrev)
+            line.set_color(loPrevLvl, color.new(cBull, 70))
+    if showDevSwing and not na(devPx)
+        if na(devLbl)
+            devLbl := label.new(bar_index, close, "", color = color.new(color.white, 100), size = size.tiny, textcolor = cNeut)
+        label.set_xy(devLbl, devBar, devPx)
+        label.set_text(devLbl, devIsHigh ? "dev H" : "dev L")
+        label.set_style(devLbl, devIsHigh ? label.style_label_down : label.style_label_up)
+        label.set_tooltip(devLbl, "Developing swing – NOT confirmed. It becomes structure only after " + str.tostring(swingLen) + " more closed bars and the ATR distance filter.")
+
+bgcolor(showChopBg and chop ? color.new(cNeut, 92) : na, title = "Chop zone")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 16. DASHBOARD  (one table, cells refreshed on the last bar only)
+// ──────────────────────────────────────────────────────────────────────────────
+f_dashPos() =>
+    switch dashPos
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+f_dashSz() =>
+    switch dashSize
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+var table dash = table.new(f_dashPos(), 3, 11, bgcolor = color.new(#131722, 10), frame_color = color.new(cNeut, 30), frame_width = 1, border_color = color.new(cNeut, 80), border_width = 1)
+var bool  dashMerged = false
+
+f_tfRow(int row, string name, int st, int ht, int lt, int bsB, int bsS, bool isChart, string sz) =>
+    string bosTag = bsB <= 3 and bsB < bsS ? " · BOS▲" : bsS <= 3 and bsS < bsB ? " · BOS▼" : ""
+    color  col    = f_stateColor(st)
+    color  scol   = ht == 1 and lt == 1 ? cBull : ht == -1 and lt == -1 ? cBear : color.new(color.white, 20)
+    table.cell(dash, 0, row, name + (isChart ? " ●" : ""), text_color = color.white, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, row, f_structText(ht, lt), text_color = scol, text_size = sz)
+    table.cell(dash, 2, row, f_stateText(st) + bosTag, text_color = col, text_size = sz, bgcolor = color.new(col, 82))
+
+if showDash and barstate.islast
+    string sz = f_dashSz()
+    if not dashMerged
+        table.merge_cells(dash, 0, 0, 2, 0)
+        table.merge_cells(dash, 1, 6, 2, 6)
+        table.merge_cells(dash, 1, 7, 2, 7)
+        table.merge_cells(dash, 1, 9, 2, 9)
+        table.merge_cells(dash, 0, 10, 2, 10)
+        dashMerged := true
+    // title + header
+    table.cell(dash, 0, 0, "MARKET STRUCTURE · " + syminfo.ticker, text_color = color.white, text_size = sz, bgcolor = color.new(cNeut, 55))
+    table.cell(dash, 0, 1, "TF",        text_color = cNeut, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 1, "STRUCTURE", text_color = cNeut, text_size = sz)
+    table.cell(dash, 2, 1, "STATUS",    text_color = cNeut, text_size = sz)
+    // timeframe rows
+    f_tfRow(2, f_tfLabel(tfHTF),   hSt, hHt, hLt, hBB, hSB, tfHTF == timeframe.period, sz)
+    f_tfRow(3, f_tfLabel(tfMTF),   mSt, mHt, mLt, mBB, mSB, tfMTF == timeframe.period, sz)
+    f_tfRow(4, f_tfLabel(tfLTF),   lSt, lHt, lLt, lBB, lSB, tfLTF == timeframe.period, sz)
+    f_tfRow(5, f_tfLabel(tfENTRY), eSt, eHt, eLt, eBB, eSB, chartIsEntry, sz)
+    // bias
+    color biasCol = str.contains(biasText, "REVERSAL") ? cWatch : biasDir > 0 ? cBull : biasDir < 0 ? cBear : cNeut
+    table.cell(dash, 0, 6, "MULTI-TF BIAS", text_color = color.white, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 6, biasText, text_color = biasCol, text_size = sz, bgcolor = color.new(biasCol, 80))
+    // condition
+    string cond = chop ? "NO TRADE — CHOP" : useSessFilt and not sessOK ? "NO TRADE — OFF SESSION" :
+         not cooldownOK ? "COOLDOWN · " + str.tostring(minBarsSig - (bar_index - lastSigBar)) + " bars" : "TRADEABLE"
+    color condCol = chop or (useSessFilt and not sessOK) ? cBear : not cooldownOK ? cWatch : cBull
+    table.cell(dash, 0, 7, "CONDITION", text_color = color.white, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 7, cond, text_color = condCol, text_size = sz, bgcolor = color.new(condCol, 82))
+    // session / momentum / volatility
+    table.cell(dash, 0, 8, "SESSION " + sessName, text_color = sessOK ? color.white : cNeut, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 8, "ADX " + str.tostring(adx, "#.#") + (weakADX ? " ↓" : ""), text_color = weakADX ? cWatch : color.white, text_size = sz)
+    table.cell(dash, 2, 8, "ATR " + str.tostring(cATR, format.mintick) + (atrComp ? " ↓" : ""), text_color = atrComp ? cWatch : color.white, text_size = sz)
+    // last signal
+    string lastTxt = lastSigText == "—" ? "—" : lastSigText + " " + str.tostring(lastSigScore) + " · " + str.tostring(bar_index - lastSigBar) + " bars ago"
+    color  lastCol = str.contains(lastSigText, "LONG") ? cBull : str.contains(lastSigText, "SHORT") ? cBear : cNeut
+    table.cell(dash, 0, 9, "LAST SIGNAL", text_color = color.white, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 9, lastTxt, text_color = lastCol, text_size = sz)
+    // chart note
+    string note = chartIsEntry ? "Signals on " + f_tfLabel(timeframe.period) + " · min score " + str.tostring(minScore) :
+         "Chart " + f_tfLabel(timeframe.period) + " ≠ entry " + f_tfLabel(tfENTRY) + " · signals use chart TF"
+    table.cell(dash, 0, 10, note, text_color = chartIsEntry ? cNeut : cWatch, text_size = sz)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 17. ALERTS
+//     alertcondition() → pick from the "Condition" list; alert() → "Any alert() function call"
+//     (dynamic messages with score and timeframe states). Use "Once per bar close".
+// ──────────────────────────────────────────────────────────────────────────────
+alertcondition(longCont,   "LONG",                      "{{ticker}} LONG | {{interval}} | price {{close}}")
+alertcondition(shortCont,  "SHORT",                     "{{ticker}} SHORT | {{interval}} | price {{close}}")
+alertcondition(longRev,    "LONG REVERSAL",             "{{ticker}} LONG REVERSAL | {{interval}} | price {{close}}")
+alertcondition(shortRev,   "SHORT REVERSAL",            "{{ticker}} SHORT REVERSAL | {{interval}} | price {{close}}")
+alertcondition(cBullBOS,   "Bullish BOS",               "{{ticker}} Bullish BOS | {{interval}} | price {{close}}")
+alertcondition(cBearBOS,   "Bearish BOS",               "{{ticker}} Bearish BOS | {{interval}} | price {{close}}")
+alertcondition(watchBull or watchBear, "Reversal Watch", "{{ticker}} REVERSAL WATCH | {{interval}} | price {{close}}")
+alertcondition(strongBullA, "Strong Bullish Alignment", "{{ticker}} all timeframes BULLISH | {{interval}}")
+alertcondition(strongBearA, "Strong Bearish Alignment", "{{ticker}} all timeframes BEARISH | {{interval}}")
+
+f_mtfMsg() =>
+    f_tfLabel(tfHTF) + " " + f_stateText(hSt) + " | " + f_tfLabel(tfMTF) + " " + f_stateText(mSt) + " | " +
+     f_tfLabel(tfLTF) + " " + f_stateText(lSt) + " | " + f_tfLabel(timeframe.period) + " " +
+     (cBullBOS ? "BOS▲" : cBearBOS ? "BOS▼" : f_stateText(cState))
+
+if anySig
+    alert(syminfo.ticker + " " + sigType + " | Score: " + str.tostring(sigScore) + " (" + f_strength(sigScore) + ") | " + f_mtfMsg() + " | Price " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+else if watchBull or watchBear
+    alert(syminfo.ticker + " REVERSAL WATCH " + (watchBull ? "▲" : "▼") + " | " + f_mtfMsg(), alert.freq_once_per_bar_close)
+else if cBullBOS or cBearBOS
+    alert(syminfo.ticker + (cBullBOS ? " BULLISH BOS" : " BEARISH BOS") + (cRevBull or cRevBear ? " (reversal)" : "") + " | " + f_mtfMsg(), alert.freq_once_per_bar_close)
+if strongBullA or strongBearA
+    alert(syminfo.ticker + (strongBullA ? " STRONG BULLISH ALIGNMENT" : " STRONG BEARISH ALIGNMENT") + " | " + f_mtfMsg(), alert.freq_once_per_bar_close)
