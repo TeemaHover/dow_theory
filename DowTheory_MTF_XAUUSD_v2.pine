@@ -12,7 +12,7 @@
 //    • Higher-timeframe data is taken from CLOSED HTF bars ([1] + lookahead_on).
 //    • Signals are evaluated on bar close and never move once printed.
 // ══════════════════════════════════════════════════════════════════════════════
-indicator("Dow Theory MTF Structure [XAUUSD]", shorttitle = "DOW-MTF", overlay = true,
+indicator("Dow Theory MTF Structure + Liquidity [XAUUSD]", shorttitle = "DOW-MTF+L", overlay = true,
      max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -23,6 +23,7 @@ string G_NOISE = "Noise Filter"
 string G_MTF = "Multi-Timeframe"
 string G_SIG = "Signals"
 string G_RISK = "Risk / Targets"
+string G_LIQ  = "Liquidity & Scalps"
 string G_VIS = "Visualization"
 string G_FILT = "Filters"
 string G_SESS = "Sessions"
@@ -56,6 +57,12 @@ chopMinSym   = input.int(2, "Chop: Symptoms Required", minval = 1, maxval = 5, g
      tooltip = "Chop is declared only when this many symptoms occur together: weak ADX, compressed ATR, small structure range, repeated equal highs/lows, frequent trend flips. Raise it to trade more, lower it to trade less.")
 chopRangeATR = input.float(2.0, "Chop: Max Structure Range (x ATR)", minval = 0.5, step = 0.25, group = G_NOISE,
      tooltip = "If the active swing high to swing low range is smaller than this (in ATR) while ADX is weak, the market is treated as ranging.")
+useRangeBlock = input.bool(true, "Range Blocks Continuation Entries", group = G_NOISE,
+     tooltip = "While price is boxed inside the higher-timeframe range and keeps crossing its midpoint, breakout, retest and pullback entries are refused. Reversals and scalps still fire, because fading the edges is the correct trade in a range. ADX cannot see this: every leg of a wide range is directional on its own.")
+rangeCrosses = input.int(4, "Range: Midpoint Crossings", minval = 2, maxval = 20, group = G_NOISE)
+useSpacing   = input.bool(true, "Minimum Price Spacing Between Entries", group = G_NOISE,
+     tooltip = "A second entry in the same direction must be this far in price from the previous one. The bar cooldown only spaces signals in time, which still allows three shorts at the same price.")
+minSpaceATR  = input.float(1.0, "Minimum Spacing (x ATR)", minval = 0.1, step = 0.1, group = G_NOISE)
 useSweeps    = input.bool(true, "Liquidity Sweep / Failed Break Detection", group = G_NOISE)
 sweepWatch   = input.bool(true, "Sweep Triggers Reversal Watch", group = G_NOISE,
      tooltip = "A sweep of the active structure level against the trend puts the timeframe into REVERSAL WATCH (stage 1).")
@@ -68,6 +75,10 @@ tfENTRY = input.timeframe("5",   "Entry Timeframe", group = G_MTF,
      tooltip = "Signals are generated on the CHART timeframe. Set the chart to the entry timeframe (default 5M) so entry structure and signals match exactly.")
 requireMTF  = input.bool(true, "Continuation Signals Require MTF Not Opposed", group = G_MTF,
      tooltip = "A continuation LONG is blocked while the intermediate timeframe is strictly BEARISH (and vice versa).")
+useEntryTF   = input.bool(true, "Entry TF Veto On Continuations", group = G_MTF,
+     tooltip = "Refuses a with-trend entry while the entry timeframe has just broken structure the other way. The entry timeframe is the fastest read available and until now it only fed the dashboard. A short taken while the 5M reads BULLISH with a fresh bullish break is the most common avoidable loss.")
+entryOppBars = input.int(10, "Entry TF Opposing Break Within (bars)", minval = 1, maxval = 100, group = G_MTF,
+     tooltip = "How recent the opposing break on the entry timeframe has to be for the veto to apply. Measured in entry-timeframe bars.")
 allowCtrRev = input.bool(false, "Allow Reversal Signals Against HTF", group = G_MTF,
      tooltip = "Reversal signals may fire while the HTF still points the other way (they need a very high score to pass). Off = HTF must not be strictly opposed.")
 
@@ -78,10 +89,18 @@ enableShort  = input.bool(true, "Enable SHORT", group = G_SIG)
 enableRev    = input.bool(true, "Enable Reversal Signals", group = G_SIG)
 enableRetest   = input.bool(true, "Enable Retest Entries", group = G_SIG, inline = "e2")
 enablePullback = input.bool(true, "Enable Dow Pullback Entries", group = G_SIG, inline = "e2")
+enableFVG      = input.bool(true, "Enable Fair Value Gap Entries", group = G_SIG,
+     tooltip = "A displacement leg that breaks structure leaves a three-bar gap behind it. Price returning into that gap is the same idea as the level retest but triggers earlier and far more often, because the gap sits above the broken level rather than at it.")
+fvgMinATR      = input.float(0.25, "Minimum Gap Size (x ATR)", minval = 0.05, step = 0.05, group = G_SIG,
+     tooltip = "Gaps smaller than this are noise between adjacent candles, not displacement.")
+fvgBars        = input.int(40, "Gap Stays Armed (bars)", minval = 3, maxval = 300, group = G_SIG)
+showFVG        = input.bool(true, "Draw Active Gap", group = G_SIG)
 retestBars     = input.int(30, "Retest Stays Armed (bars)", minval = 3, maxval = 200, group = G_SIG,
      tooltip = "How long after a break the retest entry remains available. One attempt per break.")
 retestTolATR   = input.float(0.10, "Retest Touch Tolerance (x ATR)", minval = 0, step = 0.05, group = G_SIG,
      tooltip = "How close price must return to the broken level for the pullback to count as a retest.")
+maxBreakATR  = input.float(1.0, "Max Close Beyond Broken Level (x ATR)", minval = 0.2, step = 0.1, group = G_SIG,
+     tooltip = "Anti-chasing filter for breakout and reversal entries: how far past the level it just broke the candle may close. This is the correct yardstick for a break; the setting below applies to pullback entries instead.")
 maxExtATR    = input.float(2.0, "Max Extension From Swing (x ATR)", minval = 0.5, step = 0.25, group = G_SIG,
      tooltip = "No signal if price is further than this from the last opposite swing (chasing).")
 confirmClose = input.bool(true, "Evaluate Signals On Bar Close Only", group = G_SIG,
@@ -102,10 +121,46 @@ tp3R        = input.float(3.0, "TP3 (R)", minval = 0.2, step = 0.1, group = G_RI
 showTP2     = input.bool(true, "Show TP2", group = G_RISK, inline = "tpv")
 showTP3     = input.bool(true, "Show TP3", group = G_RISK, inline = "tpv")
 showRRBox   = input.bool(true, "Shade Risk / Reward Zones", group = G_RISK, inline = "tpv")
+useBE       = input.bool(true, "Move Stop To Entry After TP1", group = G_RISK,
+     tooltip = "Once the first target trades, the stop moves to the entry price. Three of thirteen tracked positions reached a full unit of risk or more and then gave it all back; this turns those from losses into scratches without costing a single signal. Outcomes closed this way are tagged BE rather than SL.")
 keepDays    = input.int(30, "Keep Trades From Last (days)", minval = 1, maxval = 365, group = G_RISK,
      tooltip = "Rolling retention window. Every position whose entry falls inside this window stays drawn, open or closed. Older ones are removed. 30 = about one month.")
 maxTrades   = input.int(60, "Safety Cap (max trades on chart)", minval = 1, maxval = 100, group = G_RISK,
      tooltip = "Hard ceiling so the script cannot run out of TradingView drawing objects. Lower it if the chart feels crowded; the retention window above is the rule that normally applies.")
+
+// Liquidity & Scalps ─────────────────────────────────────────────────────────
+showLiq      = input.bool(true, "Show Liquidity Levels", group = G_LIQ)
+showERL      = input.bool(true, "External (HTF) Liquidity", group = G_LIQ, inline = "lq")
+showIRL      = input.bool(true, "Internal Liquidity", group = G_LIQ, inline = "lq")
+maxIRL       = input.int(6, "Internal Pools Remembered", minval = 2, maxval = 20, group = G_LIQ,
+     tooltip = "How many untaken chart-timeframe swings inside the higher-timeframe range are kept as liquidity pools.")
+enableScalp  = input.bool(true, "Enable Counter-Trend Scalps", group = G_LIQ,
+     tooltip = "When the higher timeframe is short, the chart timeframe still produces upward legs into internal liquidity. This allows a small long there, clearly marked as counter-trend, targeting the next internal pool rather than a full 3R run.")
+scalpScore   = input.int(60, "Minimum Scalp Score", options = [45, 50, 55, 60, 65, 70, 75], group = G_LIQ,
+     tooltip = "A counter-trend scalp can never score highly on higher-timeframe alignment, so it gets its own lower threshold.")
+scalpRoomATR = input.float(0.8, "Minimum Room To Next Pool (x ATR)", minval = 0.2, step = 0.1, group = G_LIQ,
+     tooltip = "No scalp unless the next internal liquidity pool is at least this far away, so the target is worth taking.")
+useLiqFilter = input.bool(true, "Block Entries Into Nearby Liquidity", group = G_LIQ,
+     tooltip = "An entry is refused when the nearest untaken pool in its own direction is too close. Selling just above an untouched swing low, or buying just under an untouched swing high, is the most common way a structurally correct signal still loses.")
+liqRoomATR   = input.float(0.75, "Minimum Room To Liquidity (x ATR)", minval = 0.1, step = 0.05, group = G_LIQ)
+useTargetReq = input.bool(true, "Refuse Entries With No Room To Run", group = G_LIQ,
+     tooltip = "Refuses an entry when a liquidity pool sits in its way closer than the distance below. Open space ahead, with no pool at all, is the best case and is allowed. What killed the losing shorts was not the missing target, it was selling from the bottom of the range after the low had been taken, and the zone and sweep rules handle that.")
+minRR        = input.float(1.5, "Minimum Target Distance (R)", minval = 0.5, step = 0.25, group = G_LIQ,
+     tooltip = "The nearest opposing pool must sit at least this many multiples of the prospective risk away, otherwise the trade cannot reach its own first target and is refused.")
+useEntryZone = input.bool(true, "Entry Zone Limit", group = G_LIQ,
+     tooltip = "Applies the premium and discount rule to every entry type, not just scalps. No shorts from the bottom of the higher-timeframe range or below it, no longs from the top or above it.")
+zoneFloor    = input.float(0.15, "No Shorts Below / No Longs Above (fraction)", minval = 0.0, maxval = 0.45, step = 0.05, group = G_LIQ,
+     tooltip = "0.15 blocks shorts in the lowest 15 percent of the range and longs in the highest 15 percent. Values outside the range, meaning price has already broken out, are blocked at any setting.")
+useExtSweep  = input.bool(true, "Hold Entries After An External Sweep", group = G_LIQ,
+     tooltip = "Once price trades through the higher-timeframe swing low, the sell-side liquidity sitting there has been collected and a bounce is the common outcome. Shorts are held off until the level has been clear for the cool-off below. Mirrored above for the swing high and longs. Applies to every entry type, because you never want to buy straight after the high is taken or sell straight after the low is taken.")
+extSweepBars = input.int(20, "External Sweep Cool-Off (bars)", minval = 1, maxval = 200, group = G_LIQ,
+     tooltip = "Chart-timeframe bars that must pass after price was last at or beyond the external level before entries in that direction resume.")
+useScalpZone = input.bool(true, "Scalps Only From The Right Half Of The Range", group = G_LIQ,
+     tooltip = "A counter-trend long scalp is only allowed from the lower part of the higher-timeframe range, a short scalp only from the upper part. Buying premium against a bearish higher timeframe is the worst location for that entry.")
+scalpZone    = input.float(0.5, "Scalp Zone (fraction of range)", minval = 0.2, maxval = 0.8, step = 0.05, group = G_LIQ,
+     tooltip = "0.5 means longs from the lower half and shorts from the upper half. Lower it for a stricter discount or premium requirement.")
+scalpMaxR    = input.float(2.0, "Scalp Maximum Target (R)", minval = 0.5, step = 0.25, group = G_LIQ,
+     tooltip = "Ceiling on how far a counter-trend scalp reaches. When the internal pool sits further away than this, the final target is clamped here instead, so a scalp stays a scalp rather than becoming a full counter-trend position. The pool wins whenever it is closer.")
 
 // Visualization ───────────────────────────────────────────────────────────────
 showHH       = input.bool(true,  "Show HH", group = G_VIS, inline = "v1")
@@ -136,6 +191,8 @@ cWatch       = input.color(#ffb74d, "Watch", group = G_VIS, inline = "c")
 useRSI     = input.bool(true, "Use RSI Filter", group = G_FILT, inline = "rsi")
 rsiLen     = input.int(14, "Len", minval = 2, group = G_FILT, inline = "rsi")
 rsiThr     = input.int(50, "Long > / Short <", minval = 30, maxval = 70, group = G_FILT, inline = "rsi")
+useADXGate = input.bool(true, "ADX Hard Gate (refuse entries below threshold)", group = G_FILT,
+     tooltip = "ADX used to be worth five score points and never blocked anything, so entries fired at readings of 9. With this on, every entry except a counter-trend scalp is refused while ADX sits under the threshold.")
 useADX     = input.bool(true, "Use ADX Filter", group = G_FILT, inline = "adx")
 adxLen     = input.int(14, "Len", minval = 2, group = G_FILT, inline = "adx")
 adxThr     = input.float(20, "Min ADX", minval = 5, maxval = 50, step = 1, group = G_FILT, inline = "adx")
@@ -156,6 +213,8 @@ sessTZ      = input.string("UTC", "Session Timezone", group = G_SESS, tooltip = 
 
 // Dashboard ───────────────────────────────────────────────────────────────────
 showDash = input.bool(true, "Show Dashboard", group = G_DASH)
+showDiag = input.bool(true, "Show Trade Diagnostics", group = G_DASH,
+     tooltip = "A second table listing every closed position with the best it ever ran in R, how long it was held, and the conditions at entry. This is how the entry filters were calibrated; leave it on while tuning.")
 dashPos  = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = G_DASH)
 dashSize = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal"], group = G_DASH)
 
@@ -406,9 +465,9 @@ f_engine() =>
 // Closed-bar snapshot for request.security(): expression[1] + lookahead_on returns the
 // value of the last COMPLETED bar of the requested timeframe → identical on history and realtime.
 f_secEngine() =>
-    [st, _ps, ht, lt, _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u,
+    [st, _ps, ht, lt, _a, _b, shx, _d, slx, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u,
       bsBB, bsSB, bsRB, bsRS, _v, _w] = f_engine()
-    [st[1], ht[1], lt[1], bsBB[1], bsSB[1], bsRB[1], bsRS[1]]
+    [st[1], ht[1], lt[1], bsBB[1], bsSB[1], bsRB[1], bsRS[1], shx[1], slx[1]]
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 9. CHART-TIMEFRAME ENGINE  (signals and drawings live here – set chart = entry TF)
@@ -420,16 +479,18 @@ f_secEngine() =>
 // ──────────────────────────────────────────────────────────────────────────────
 // 10. MULTI-TIMEFRAME CALCULATIONS  (exactly four requests, closed-bar data only)
 // ──────────────────────────────────────────────────────────────────────────────
-[hSt0, hHt0, hLt0, hBB0, hSB0, hRB0, hRS0] = request.security(syminfo.tickerid, tfHTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
-[mSt0, mHt0, mLt0, mBB0, mSB0, mRB0, mRS0] = request.security(syminfo.tickerid, tfMTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
-[lSt0, lHt0, lLt0, lBB0, lSB0, lRB0, lRS0] = request.security(syminfo.tickerid, tfLTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
-[eSt0, eHt0, eLt0, eBB0, eSB0, eRB0, eRS0] = request.security(syminfo.tickerid, tfENTRY, f_secEngine(), lookahead = barmerge.lookahead_on)
+[hSt0, hHt0, hLt0, hBB0, hSB0, hRB0, hRS0, hSH0, hSL0] = request.security(syminfo.tickerid, tfHTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
+[mSt0, mHt0, mLt0, mBB0, mSB0, mRB0, mRS0, mSH0, mSL0] = request.security(syminfo.tickerid, tfMTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
+[lSt0, lHt0, lLt0, lBB0, lSB0, lRB0, lRS0, lSH0, lSL0] = request.security(syminfo.tickerid, tfLTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
+[eSt0, eHt0, eLt0, eBB0, eSB0, eRB0, eRS0, eSH0, eSL0] = request.security(syminfo.tickerid, tfENTRY, f_secEngine(), lookahead = barmerge.lookahead_on)
 
 // A timeframe equal to the chart uses the live chart engine (no closed-bar offset needed)
 f_pick(string tf, int secVal, int localVal) =>
     tf == timeframe.period ? localVal : nz(secVal)
 f_pickN(string tf, int secVal, int localVal) =>
     tf == timeframe.period ? localVal : nz(secVal, 100000)
+f_pickF(string tf, float secVal, float localVal) =>
+    tf == timeframe.period ? localVal : secVal
 
 int hSt = f_pick(tfHTF, hSt0, cState)
 int hHt = f_pick(tfHTF, hHt0, cHiType)
@@ -451,6 +512,8 @@ int eHt = f_pick(tfENTRY, eHt0, cHiType)
 int eLt = f_pick(tfENTRY, eLt0, cLoType)
 int eBB = f_pickN(tfENTRY, eBB0, cBsBullBOS)
 int eSB = f_pickN(tfENTRY, eSB0, cBsBearBOS)
+float hSH = f_pickF(tfHTF, hSH0, cSH)
+float hSL = f_pickF(tfHTF, hSL0, cSL)
 bool chartIsEntry = tfENTRY == timeframe.period
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -480,6 +543,131 @@ bool  weakADX  = adx < adxThr
 bool  atrComp  = cATR < atrAvg * atrMinFac
 int   chopSym  = (weakADX ? 1 : 0) + (atrComp ? 1 : 0) + (rangeATR < chopRangeATR ? 1 : 0) + (eqCount >= 2 ? 1 : 0) + (flips >= chopFlips ? 1 : 0)
 bool  chop     = useChop and chopSym >= chopMinSym
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 11b. LIQUIDITY MAP — EXTERNAL (HTF) AND INTERNAL (CHART TF)
+//      External liquidity = the higher-timeframe swing high and low. That is where the
+//      HTF leg is ultimately drawn to, and taking one ends the current range.
+//      Internal liquidity = chart-timeframe swings sitting inside that range which have
+//      not been traded through yet. Those are the pools a pullback reaches for while the
+//      higher timeframe stays in its trend.
+// ──────────────────────────────────────────────────────────────────────────────
+var array<float> irlHi = array.new<float>()
+var array<float> irlLo = array.new<float>()
+bool htfRangeOK = not na(hSH) and not na(hSL) and hSH > hSL
+bool inHtfRange = htfRangeOK and close < hSH and close > hSL
+
+// external sweep: the moment price reaches a higher-timeframe extreme, the liquidity resting
+// there is collected. Selling straight after the low is taken, or buying straight after the
+// high is taken, is trading into the side that has just been filled.
+bool extLoTouch = htfRangeOK and low <= hSL
+bool extHiTouch = htfRangeOK and high >= hSH
+var bool inExtLo = false
+var bool inExtHi = false
+bool extLoEvt = extLoTouch and not inExtLo
+bool extHiEvt = extHiTouch and not inExtHi
+inExtLo := extLoTouch
+inExtHi := extHiTouch
+
+// measured from the START of the excursion, not the last touch, so a genuine breakdown that
+// simply stays below the level resumes trading once the cool-off expires
+var int extLoStart = na
+var int extHiStart = na
+if extLoEvt
+    extLoStart := bar_index
+if extHiEvt
+    extHiStart := bar_index
+int barsSinceExtLo = na(extLoStart) ? 100000 : bar_index - extLoStart
+int barsSinceExtHi = na(extHiStart) ? 100000 : bar_index - extHiStart
+
+// a short is held while the external low is still fresh, a long while the external high is
+bool extOKShort = not useExtSweep or barsSinceExtLo > extSweepBars
+bool extOKLong  = not useExtSweep or barsSinceExtHi > extSweepBars
+// the same event is evidence for the trade in the opposite direction
+bool extEvLong  = barsSinceExtLo <= extSweepBars * 2
+bool extEvShort = barsSinceExtHi <= extSweepBars * 2
+
+
+if htfRangeOK
+    if cHiEvt == 1 and not na(cSH) and cSH < hSH and cSH > hSL
+        array.push(irlHi, cSH)
+        if array.size(irlHi) > maxIRL
+            array.shift(irlHi)
+    if cLoEvt == 1 and not na(cSL) and cSL > hSL and cSL < hSH
+        array.push(irlLo, cSL)
+        if array.size(irlLo) > maxIRL
+            array.shift(irlLo)
+
+// a pool stops being liquidity once price trades through it
+if array.size(irlHi) > 0
+    for i = array.size(irlHi) - 1 to 0
+        if array.get(irlHi, i) < high
+            array.remove(irlHi, i)
+if array.size(irlLo) > 0
+    for i = array.size(irlLo) - 1 to 0
+        if array.get(irlLo, i) > low
+            array.remove(irlLo, i)
+
+// nearest untaken pool on each side
+float irlUp = na
+float irlDn = na
+if array.size(irlHi) > 0
+    for i = 0 to array.size(irlHi) - 1
+        float v = array.get(irlHi, i)
+        if v > close and (na(irlUp) or v < irlUp)
+            irlUp := v
+if array.size(irlLo) > 0
+    for i = 0 to array.size(irlLo) - 1
+        float v = array.get(irlLo, i)
+        if v < close and (na(irlDn) or v > irlDn)
+            irlDn := v
+
+int   htfDir  = f_dirOf(hSt)
+int   locDir  = f_dirOf(cState)
+string liqPhase = "—"
+if htfRangeOK
+    if useExtSweep and barsSinceExtLo <= extSweepBars
+        liqPhase := "EXT SWEEP ▼ · shorts held"
+    else if useExtSweep and barsSinceExtHi <= extSweepBars
+        liqPhase := "EXT SWEEP ▲ · longs held"
+    else if not inHtfRange
+        liqPhase := "EXTERNAL · expansion"
+    else if locDir != 0 and htfDir != 0 and locDir != htfDir
+        liqPhase := "INTERNAL · counter-trend leg"
+    else if htfDir == 0
+        liqPhase := "INTERNAL · range"
+    else
+        liqPhase := "INTERNAL · with trend"
+
+// nearest obstacle in each direction: the internal pool if one survives, otherwise the range edge
+float obstUp = na
+float obstDn = na
+if not na(irlUp)
+    obstUp := irlUp
+else if htfRangeOK and hSH > close
+    obstUp := hSH
+if not na(irlDn)
+    obstDn := irlDn
+else if htfRangeOK and hSL < close
+    obstDn := hSL
+bool liqRoomLong  = not useLiqFilter or na(obstUp) or obstUp - close >= liqRoomATR * cATR
+bool liqRoomShort = not useLiqFilter or na(obstDn) or close - obstDn >= liqRoomATR * cATR
+
+// where price sits inside the higher-timeframe range: 0 at the low, 1 at the high
+float rangePos   = htfRangeOK and hSH > hSL ? (close - hSL) / (hSH - hSL) : 0.5
+bool  scalpZoneUp = not useScalpZone or rangePos <= scalpZone
+bool  scalpZoneDn = not useScalpZone or rangePos >= 1.0 - scalpZone
+// premium and discount, applied to every entry type
+bool  zoneOKLong  = not useEntryZone or rangePos <= 1.0 - zoneFloor
+bool  zoneOKShort = not useEntryZone or rangePos >= zoneFloor
+
+// boxed range: price stays inside the HTF range and keeps crossing its midpoint.
+// ADX stays high through a range this wide because every individual leg trends.
+float htfMid   = htfRangeOK ? (hSH + hSL) / 2.0 : na
+bool  midCross = htfRangeOK and not na(htfMid) and ((close > htfMid and close[1] <= htfMid) or (close < htfMid and close[1] >= htfMid))
+int   midCrosses = int(math.sum(midCross ? 1 : 0, chopWindow))
+bool  boxed    = inHtfRange and midCrosses >= rangeCrosses
+bool  trendOK  = not (useRangeBlock and boxed)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 12. MULTI-TIMEFRAME BIAS
@@ -536,7 +724,11 @@ f_score(int dir, int kind, bool evDow, bool evSwp) =>
         int q = dir == 1 ? (cHiType == 1 ? 1 : 0) + (cLoType == 1 ? 1 : 0) : (cHiType == -1 ? 1 : 0) + (cLoType == -1 ? 1 : 0)
         sDow := q == 2 ? 25 : q == 1 ? 17 : 10
     // 2. HTF alignment
-    float sHTF = f_alignPts(hSt, dir, 12) + f_alignPts(mSt, dir, 8) + f_alignPts(lSt, dir, 5)
+    // Alignment peaks exactly when price is most extended, which is why losers scored 78 to 97.
+    // Discount it by where in the range the trade is being taken.
+    float locQ = dir == 1 ? 1.0 - rangePos : rangePos
+    float locF = locQ >= 0.5 ? 1.0 : locQ >= 0.25 ? 0.8 : 0.55
+    float sHTF = (f_alignPts(hSt, dir, 12) + f_alignPts(mSt, dir, 8) + f_alignPts(lSt, dir, 5)) * locF
     // 3. break quality – fresh break: displacement beyond the level; retest: the break already proved itself;
     //    pullback: partial credit, and only while a same-direction break is still recent
     float lvl    = dir == 1 ? cSH : cSL
@@ -547,9 +739,11 @@ f_score(int dir, int kind, bool evDow, bool evSwp) =>
         3 => bsSame <= 150 ? 11.0 : 7.0
         => bosMode == "Wick" ? 10.0 : disp >= 0.5 ? 15.0 : 10.0
     // 4. volatility – ATR not compressed, price not extended from the opposite swing
-    float opp  = dir == 1 ? cSL : cSH
-    float ext  = cATR > 0 and not na(opp) ? (dir == 1 ? close - opp : opp - close) / cATR : 0.0
-    float sVol = (atrOK ? 5 : 0) + (ext <= maxExtATR * 0.6 ? 5 : 2)
+    float opp   = dir == 1 ? cSL : cSH
+    float extSw = cATR > 0 and not na(opp) ? (dir == 1 ? close - opp : opp - close) / cATR : 0.0
+    float chase = kind <= 1 ? disp : extSw
+    float chLim = kind <= 1 ? maxBreakATR * 0.75 : maxExtATR * 0.6
+    float sVol = (atrOK ? 5 : 0) + (chase <= chLim ? 5 : 2)
     // 5. momentum (disabled filters count as neutral = full points)
     float sMom = ((dir == 1 ? rsiLongOK : rsiShortOK) ? 5 : 0) + (adxOK ? 5 : 0)
     // 6. reversal – reversal: stage-1 evidence existed; others: no timeframe warns against the trade
@@ -559,12 +753,30 @@ f_score(int dir, int kind, bool evDow, bool evSwp) =>
     int   bsRef  = isRev ? (dir == 1 ? cBsBullBOS[1] : cBsBearBOS[1]) + 1 : (dir == 1 ? cBsBearBOS : cBsBullBOS)
     float sNoise = bsRef >= 2 * minBarsSig ? 5 : 0
     int total = int(math.round(sDow + sHTF + sBOS + sVol + sMom + sRev + sNoise))
-    string bd = "Dow " + str.tostring(sDow, "#") + " | HTF " + str.tostring(sHTF, "#.#") + " | BOS " + str.tostring(sBOS, "#") +
-         " | Vol " + str.tostring(sVol, "#") + " | Mom " + str.tostring(sMom, "#") + " | Rev " + str.tostring(sRev, "#") + " | Noise " + str.tostring(sNoise, "#")
+    // this function runs ten times a bar; only spend the string work on a score that could print
+    string bd = ""
+    if total >= math.min(minScore, scalpScore)
+        bd := "Loc x" + str.tostring(locF, "0.00") + " | "
+        bd += "Dow " + str.tostring(sDow, "#") + " | HTF " + str.tostring(sHTF, "#.#") + " | BOS " + str.tostring(sBOS, "#") +
+             " | Vol " + str.tostring(sVol, "#") + " | Mom " + str.tostring(sMom, "#") + " | Rev " + str.tostring(sRev, "#") + " | Noise " + str.tostring(sNoise, "#")
     [total, bd]
 
 f_strength(int s) =>
     s >= 85 ? "VERY STRONG" : s >= 70 ? "STRONG" : s >= 50 ? "MODERATE" : "WEAK"
+
+f_slPrice(int dir, float entry, float atrv) =>
+    float structSL = dir == 1 ? (na(cSL) ? na : cSL - slBufATR * atrv) : (na(cSH) ? na : cSH + slBufATR * atrv)
+    float atrSL    = dir == 1 ? entry - slATRmult * atrv : entry + slATRmult * atrv
+    float px = switch slMode
+        "ATR"       => atrSL
+        "Structure" => na(structSL) ? atrSL : structSL
+        =>             na(structSL) ? atrSL : (dir == 1 ? math.max(structSL, atrSL) : math.min(structSL, atrSL))
+    float minDist = math.max(syminfo.mintick * 10, atrv * 0.15)
+    if dir == 1 and (na(px) or px > entry - minDist)
+        px := entry - math.max(slATRmult * atrv, minDist)
+    if dir == -1 and (na(px) or px < entry + minDist)
+        px := entry + math.max(slATRmult * atrv, minDist)
+    px
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 13b. SECOND-CHANCE ENTRIES — RETEST AND DOW PULLBACK
@@ -605,10 +817,58 @@ if retestShortRaw or (not na(bosDnLvl) and close > bosDnLvl + cATR * 0.5)
 bool pbLongRaw  = cLoEvt == 1 and cLoType == 1 and cState == 1
 bool pbShortRaw = cHiEvt == 1 and cHiType == -1 and cState == -1
 
+// ── fair value gap: the three-bar hole a displacement leaves behind ──
+var float fvgUpTop  = na
+var float fvgUpBot  = na
+var int   fvgUpBar  = na
+var bool  fvgUpUsed = true
+var float fvgDnTop  = na
+var float fvgDnBot  = na
+var int   fvgDnBar  = na
+var bool  fvgDnUsed = true
+
+if low > high[2] and low - high[2] >= fvgMinATR * cATR
+    fvgUpTop  := low
+    fvgUpBot  := high[2]
+    fvgUpBar  := bar_index
+    fvgUpUsed := false
+if high < low[2] and low[2] - high >= fvgMinATR * cATR
+    fvgDnTop  := low[2]
+    fvgDnBot  := high
+    fvgDnBar  := bar_index
+    fvgDnUsed := false
+
+// entry when price trades back into the gap and closes back out of it in the trend direction
+bool fvgLongRaw = enableFVG and not na(fvgUpTop) and not fvgUpUsed and cState == 1 and
+     bar_index > nz(fvgUpBar, -1) and bar_index - fvgUpBar <= fvgBars and
+     low <= fvgUpTop and close > fvgUpBot and close > open
+bool fvgShortRaw = enableFVG and not na(fvgDnBot) and not fvgDnUsed and cState == -1 and
+     bar_index > nz(fvgDnBar, -1) and bar_index - fvgDnBar <= fvgBars and
+     high >= fvgDnBot and close < fvgDnTop and close < open
+// one attempt per gap, and the gap dies when price closes through it
+if fvgLongRaw or (not na(fvgUpBot) and close < fvgUpBot)
+    fvgUpUsed := true
+if fvgShortRaw or (not na(fvgDnTop) and close > fvgDnTop)
+    fvgDnUsed := true
+
+// counter-trend scalp: the higher timeframe is trending, the chart timeframe turns against it
+// while price is still inside the HTF range, and an untaken internal pool is worth reaching for
+// hSt != 1 covers both cases worth fading: the higher timeframe against you, and no higher
+// timeframe direction at all. Range fades into internal liquidity were the only consistent
+// winners in testing, and requiring a strictly trending HTF was locking them out of ranges.
+bool scalpLongRaw  = hSt != 1  and (cBullBOS or cRevBull) and inHtfRange
+bool scalpShortRaw = hSt != -1 and (cBearBOS or cRevBear) and inHtfRange
+bool scalpRoomUp   = not na(irlUp) ? irlUp - close >= scalpRoomATR * cATR : htfRangeOK and hSH - close >= scalpRoomATR * cATR
+bool scalpRoomDn   = not na(irlDn) ? close - irlDn >= scalpRoomATR * cATR : htfRangeOK and close - hSL >= scalpRoomATR * cATR
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 14. SIGNAL ENGINE
 // ──────────────────────────────────────────────────────────────────────────────
-var int lastSigBar = na
+var int   lastSigBar  = na
+var float lastLongPx  = na
+var float lastShortPx = na
+bool spaceLong  = not useSpacing or na(lastLongPx)  or math.abs(close - lastLongPx)  >= minSpaceATR * cATR
+bool spaceShort = not useSpacing or na(lastShortPx) or math.abs(close - lastShortPx) >= minSpaceATR * cATR
 bool cooldownOK   = na(lastSigBar) or bar_index - lastSigBar >= minBarsSig
 bool cooldownFast = na(lastSigBar) or bar_index - lastSigBar >= math.max(3.0, minBarsSig / 3.0)
 bool barOK        = not confirmClose or barstate.isconfirmed
@@ -624,41 +884,121 @@ bool candShortRev  = enableShort and enableRev and cRevBear
 // higher-timeframe conflict gates
 bool htfOKLong  = hSt != -1 and (not requireMTF or mSt != -1)
 bool htfOKShort = hSt != 1 and (not requireMTF or mSt != 1)
+// entry-timeframe veto: the fastest read has just broken the other way
+bool entryOKLong  = not useEntryTF or not (eSt == -1 and eSB <= entryOppBars)
+bool entryOKShort = not useEntryTF or not (eSt == 1  and eBB <= entryOppBars)
 bool revOKLong  = allowCtrRev or hSt != -1
 bool revOKShort = allowCtrRev or hSt != 1
 
-// extension gate (don't chase)
+// anti-chasing. A break is judged by how far past the broken level the candle closed;
+// a pullback entry is judged by how far it sits from the swing that protects it.
+float brkLong  = cATR > 0 and not na(cSH) ? (close - cSH) / cATR : 0.0
+float brkShort = cATR > 0 and not na(cSL) ? (cSL - close) / cATR : 0.0
 float extLong  = cATR > 0 and not na(cSL) ? (close - cSL) / cATR : 0.0
 float extShort = cATR > 0 and not na(cSH) ? (cSH - close) / cATR : 0.0
 
+// prospective risk, and how far the nearest opposing pool sits in multiples of it
+float riskLong  = math.abs(close - f_slPrice(1, close, cATR))
+float riskShort = math.abs(close - f_slPrice(-1, close, cATR))
+float rrLong    = na(obstUp) or riskLong  <= 0 ? na : (obstUp - close) / riskLong
+float rrShort   = na(obstDn) or riskShort <= 0 ? na : (close - obstDn) / riskShort
+// no known target means nowhere to go, not unlimited room
+// A target too close to reach is a bad trade. NO target is open space, which is the best
+// case, not the worst. Refusing it was what collapsed the signal count: a trend by definition
+// runs into ground with no untaken structure ahead of it.
+bool targetOKLong  = not useTargetReq or na(rrLong)  or rrLong  >= minRR
+bool targetOKShort = not useTargetReq or na(rrShort) or rrShort >= minRR
+bool adxGateOK     = not useADXGate or adx >= adxThr
+// a reversal happens as trend strength dies, so holding it to the trend threshold is wrong;
+// it still needs a market with a pulse, hence 60 per cent of the same number
+bool adxGateSoft   = not useADXGate or adx >= adxThr * 0.6
+
 [scLC, bdLC] = f_score(1,  0, false, false)
-[scLR, bdLR] = f_score(1,  1, cREvDow, cREvSwp)
+[scLR, bdLR] = f_score(1,  1, cREvDow, cREvSwp or extEvLong)
 [scSC, bdSC] = f_score(-1, 0, false, false)
-[scSR, bdSR] = f_score(-1, 1, cREvDow, cREvSwp)
+[scSR, bdSR] = f_score(-1, 1, cREvDow, cREvSwp or extEvShort)
 [scLT, bdLT] = f_score(1,  2, false, false)
 [scST, bdST] = f_score(-1, 2, false, false)
 [scLP, bdLP] = f_score(1,  3, false, false)
 [scSP, bdSP] = f_score(-1, 3, false, false)
+[scLF, bdLF] = f_score(1,  2, false, false)
+[scSF, bdSF] = f_score(-1, 2, false, false)
+[scLS, bdLS] = f_score(1,  cRevBull ? 1 : 0, cREvDow, cREvSwp or extEvLong)
+[scSS, bdSS] = f_score(-1, cRevBear ? 1 : 0, cREvDow, cREvSwp or extEvShort)
 
-bool longCont  = gateCommon and candLongCont  and htfOKLong  and extLong  <= maxExtATR and scLC >= minScore
-bool longRev   = gateCommon and candLongRev   and revOKLong  and extLong  <= maxExtATR and scLR >= minScore
-bool shortCont = gateCommon and candShortCont and htfOKShort and extShort <= maxExtATR and scSC >= minScore
-bool shortRev  = gateCommon and candShortRev  and revOKShort and extShort <= maxExtATR and scSR >= minScore
+bool longCont  = gateCommon and candLongCont  and htfOKLong  and brkLong  <= maxBreakATR and scLC >= minScore and liqRoomLong  and spaceLong  and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK
+bool longRev   = gateCommon and candLongRev   and revOKLong  and brkLong  <= maxBreakATR and scLR >= minScore and liqRoomLong  and spaceLong  and extOKLong and targetOKLong and zoneOKLong and adxGateSoft
+bool shortCont = gateCommon and candShortCont and htfOKShort and brkShort <= maxBreakATR and scSC >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK
+bool shortRev  = gateCommon and candShortRev  and revOKShort and brkShort <= maxBreakATR and scSR >= minScore and liqRoomShort and spaceShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft
 // second-chance entries – their own shorter cooldown so a retest is not swallowed by the breakout signal
-bool longRetest  = gateFast and enableRetest   and retestLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLT >= minScore and not (longCont or longRev)
-bool shortRetest = gateFast and enableRetest   and retestShortRaw and htfOKShort and extShort <= maxExtATR and scST >= minScore and not (shortCont or shortRev)
-bool longPB      = gateFast and enablePullback and pbLongRaw  and hSt == 1  and mSt != -1 and extLong  <= maxExtATR and scLP >= minScore and not (longCont or longRev or longRetest)
-bool shortPB     = gateFast and enablePullback and pbShortRaw and hSt == -1 and mSt != 1  and extShort <= maxExtATR and scSP >= minScore and not (shortCont or shortRev or shortRetest)
-bool anySig    = longCont or longRev or shortCont or shortRev or longRetest or shortRetest or longPB or shortPB
+bool longRetest  = gateFast and enableLong  and enableRetest   and retestLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLT >= minScore and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev)
+bool shortRetest = gateFast and enableShort and enableRetest   and retestShortRaw and htfOKShort and extShort <= maxExtATR and scST >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev)
+bool longPB      = gateFast and enableLong  and enablePullback and pbLongRaw  and hSt == 1  and mSt != -1 and extLong  <= maxExtATR and scLP >= minScore and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev or longRetest)
+bool shortPB     = gateFast and enableShort and enablePullback and pbShortRaw and hSt == -1 and mSt != 1  and extShort <= maxExtATR and scSP >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev or shortRetest)
+// counter-trend scalps into internal liquidity – lower bar, because HTF alignment can never pay here
+bool longScalp  = gateFast and enableLong  and enableScalp and scalpLongRaw  and scalpRoomUp and brkLong  <= maxBreakATR and scLS >= scalpScore and scalpZoneUp and spaceLong and extOKLong and targetOKLong and zoneOKLong and adxGateSoft and not (longCont or longRev or longRetest or longPB)
+bool shortScalp = gateFast and enableShort and enableScalp and scalpShortRaw and scalpRoomDn and brkShort <= maxBreakATR and scSS >= scalpScore and scalpZoneDn and spaceShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft and not (shortCont or shortRev or shortRetest or shortPB)
+bool longFVG   = gateFast and enableLong  and fvgLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLF >= minScore and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev or longRetest or longPB)
+bool shortFVG  = gateFast and enableShort and fvgShortRaw and htfOKShort and extShort <= maxExtATR and scSF >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev or shortRetest or shortPB)
+bool anySig    = longCont or longRev or shortCont or shortRev or longRetest or shortRetest or longPB or shortPB or longScalp or shortScalp or longFVG or shortFVG
+
+// ── gate audit: which rule refuses the most valid setups ──────────────────
+var int auCand   = 0
+var int auTaken  = 0
+var int auScore  = 0
+var int auHtf    = 0
+var int auEntry  = 0
+var int auSweep  = 0
+var int auZone   = 0
+var int auTarget = 0
+var int auAdx    = 0
+var int auRoom   = 0
+var int auSpace  = 0
+var int auRange  = 0
+var int auCool   = 0
+var int auChop   = 0
+bool candL = candLongCont  or candLongRev  or retestLongRaw  or pbLongRaw  or scalpLongRaw  or fvgLongRaw
+bool candS = candShortCont or candShortRev or retestShortRaw or pbShortRaw or scalpShortRaw or fvgShortRaw
+if (candL or candS) and barstate.isconfirmed
+    auCand += 1
+    if anySig
+        auTaken += 1
+    else
+        if not cooldownFast
+            auCool += 1
+        if chop
+            auChop += 1
+        if not trendOK
+            auRange += 1
+        if not adxGateSoft
+            auAdx += 1
+        if (candL and not htfOKLong) or (candS and not htfOKShort)
+            auHtf += 1
+        if (candL and not entryOKLong) or (candS and not entryOKShort)
+            auEntry += 1
+        if (candL and not extOKLong) or (candS and not extOKShort)
+            auSweep += 1
+        if (candL and not zoneOKLong) or (candS and not zoneOKShort)
+            auZone += 1
+        if (candL and not targetOKLong) or (candS and not targetOKShort)
+            auTarget += 1
+        if (candL and not liqRoomLong) or (candS and not liqRoomShort)
+            auRoom += 1
+        if (candL and not spaceLong) or (candS and not spaceShort)
+            auSpace += 1
+        float bestL = math.max(math.max(scLC, scLR), math.max(scLT, scLP))
+        float bestS = math.max(math.max(scSC, scSR), math.max(scST, scSP))
+        if (candL and bestL < minScore and scLS < scalpScore) or (candS and bestS < minScore and scSS < scalpScore)
+            auScore += 1
 
 // setups that passed every gate but not the score (optional tiny markers)
-bool weakLong  = gateCommon and ((candLongCont and htfOKLong) or (candLongRev and revOKLong)) and extLong <= maxExtATR and not (longCont or longRev or longRetest or longPB)
-bool weakShort = gateCommon and ((candShortCont and htfOKShort) or (candShortRev and revOKShort)) and extShort <= maxExtATR and not (shortCont or shortRev or shortRetest or shortPB)
+bool weakLong  = gateCommon and ((candLongCont and htfOKLong) or (candLongRev and revOKLong)) and brkLong <= maxBreakATR and not (longCont or longRev or longRetest or longPB)
+bool weakShort = gateCommon and ((candShortCont and htfOKShort) or (candShortRev and revOKShort)) and brkShort <= maxBreakATR and not (shortCont or shortRev or shortRetest or shortPB)
 int  weakScore = weakLong ? (candLongRev ? scLR : scLC) : weakShort ? (candShortRev ? scSR : scSC) : 0
 
-int    sigScore = longCont ? scLC : longRev ? scLR : shortCont ? scSC : shortRev ? scSR : longRetest ? scLT : shortRetest ? scST : longPB ? scLP : shortPB ? scSP : 0
-string sigBreak = longCont ? bdLC : longRev ? bdLR : shortCont ? bdSC : shortRev ? bdSR : longRetest ? bdLT : shortRetest ? bdST : longPB ? bdLP : shortPB ? bdSP : ""
-string sigType  = longCont ? "LONG" : longRev ? "LONG REVERSAL" : shortCont ? "SHORT" : shortRev ? "SHORT REVERSAL" : longRetest ? "LONG RETEST" : shortRetest ? "SHORT RETEST" : longPB ? "LONG PULLBACK" : shortPB ? "SHORT PULLBACK" : ""
+int    sigScore = longCont ? scLC : longRev ? scLR : shortCont ? scSC : shortRev ? scSR : longRetest ? scLT : shortRetest ? scST : longPB ? scLP : shortPB ? scSP : longScalp ? scLS : shortScalp ? scSS : longFVG ? scLF : shortFVG ? scSF : 0
+string sigBreak = longCont ? bdLC : longRev ? bdLR : shortCont ? bdSC : shortRev ? bdSR : longRetest ? bdLT : shortRetest ? bdST : longPB ? bdLP : shortPB ? bdSP : longScalp ? bdLS : shortScalp ? bdSS : longFVG ? bdLF : shortFVG ? bdSF : ""
+string sigType  = longCont ? "LONG" : longRev ? "LONG REVERSAL" : shortCont ? "SHORT" : shortRev ? "SHORT REVERSAL" : longRetest ? "LONG RETEST" : shortRetest ? "SHORT RETEST" : longPB ? "LONG PULLBACK" : shortPB ? "SHORT PULLBACK" : longScalp ? "LONG SCALP" : shortScalp ? "SHORT SCALP" : longFVG ? "LONG FVG" : shortFVG ? "SHORT FVG" : ""
 
 var string lastSigText  = "—"
 var int    lastSigScore = 0
@@ -666,6 +1006,10 @@ if anySig
     lastSigBar   := bar_index
     lastSigText  := sigType
     lastSigScore := sigScore
+    if longCont or longRev or longRetest or longPB or longScalp
+        lastLongPx := close
+    else
+        lastShortPx := close
 
 // stage-1 transitions and alignment events (for markers and alerts)
 bool watchBull   = cState == 2 and cPrevState != 2
@@ -684,6 +1028,12 @@ type Trade
     int    dir    = 0
     int    bar    = 0
     int    t0     = 0
+    string kind   = ""
+    int    score  = 0
+    float  mfe    = 0.0
+    float  rR     = 0.0
+    int    held   = 0
+    string ctx    = ""
     float  entry  = na
     float  sl     = na
     float  t1     = na
@@ -706,20 +1056,6 @@ type Trade
     label  lb2    = na
     label  lb3    = na
     label  lbR    = na
-
-f_slPrice(int dir, float entry, float atrv) =>
-    float structSL = dir == 1 ? (na(cSL) ? na : cSL - slBufATR * atrv) : (na(cSH) ? na : cSH + slBufATR * atrv)
-    float atrSL    = dir == 1 ? entry - slATRmult * atrv : entry + slATRmult * atrv
-    float px = switch slMode
-        "ATR"       => atrSL
-        "Structure" => na(structSL) ? atrSL : structSL
-        =>             na(structSL) ? atrSL : (dir == 1 ? math.max(structSL, atrSL) : math.min(structSL, atrSL))
-    float minDist = math.max(syminfo.mintick * 10, atrv * 0.15)
-    if dir == 1 and (na(px) or px > entry - minDist)
-        px := entry - math.max(slATRmult * atrv, minDist)
-    if dir == -1 and (na(px) or px < entry + minDist)
-        px := entry + math.max(slATRmult * atrv, minDist)
-    px
 
 f_tpPrices(int dir, float entry, float slPx) =>
     float risk = math.abs(entry - slPx)
@@ -763,6 +1099,7 @@ f_wipe(Trade t) =>
 f_close(Trade t, string reason, color col, float atPx) =>
     t.active := false
     t.res    := reason
+    t.rR     := t.risk > 0 ? (atPx - t.entry) / t.risk * t.dir : 0.0
     label.set_xy(t.lbR, bar_index, atPx)
     label.set_text(t.lbR, reason)
     label.set_textcolor(t.lbR, col)
@@ -774,17 +1111,32 @@ bool slJustHit = false
 
 // ── new signal: close opposing positions, cull the oldest, record this one ──
 if showSLTP and anySig
-    int   dir = (longCont or longRev or longRetest or longPB) ? 1 : -1
+    int   dir = (longCont or longRev or longRetest or longPB or longScalp or longFVG) ? 1 : -1
     float e   = close
     float s   = f_slPrice(dir, e, cATR)
-    [q1, q2, q3, rk] = f_tpPrices(dir, e, s)
+    [tq1, tq2, tq3, rk] = f_tpPrices(dir, e, s)
+    float q1 = tq1
+    float q2 = tq2
+    float q3 = tq3
+    // a counter-trend scalp aims at the next internal pool instead of a full run
+    float cap = longScalp or shortScalp ? (dir == 1 ? irlUp : irlDn) : na
+    if not na(cap) and ((dir == 1 and cap > e) or (dir == -1 and cap < e))
+        // ceiling: a scalp never reaches beyond scalpMaxR, however far away the pool sits
+        float ceilPx = e + dir * scalpMaxR * rk
+        if (dir == 1 and cap > ceilPx) or (dir == -1 and cap < ceilPx)
+            cap := ceilPx
+        float span = cap - e
+        q1 := e + span * 0.4
+        q2 := e + span * 0.7
+        q3 := cap
     float fin = showTP3 ? q3 : showTP2 ? q2 : q1
     if array.size(trades) > 0
         for i = 0 to array.size(trades) - 1
             Trade t = array.get(trades, i)
             if t.active and t.dir != dir
                 f_close(t, "closed · reverse signal", cNeut, e)
-    Trade tr = Trade.new(dir = dir, bar = bar_index, t0 = time, entry = e, sl = s, t1 = q1, t2 = q2, t3 = q3, fin = fin, risk = rk)
+    string ctxTxt = "rp " + str.tostring(rangePos, "0.00") + "  rr " + str.tostring(dir == 1 ? rrLong : rrShort, "0.0") + "  adx " + str.tostring(adx, "0")
+    Trade tr = Trade.new(dir = dir, bar = bar_index, t0 = time, entry = e, sl = s, t1 = q1, t2 = q2, t3 = q3, fin = fin, risk = rk, kind = sigType, score = sigScore, ctx = ctxTxt)
     color colE = color.new(color.white, 15)
     tr.lnE := line.new(bar_index, e,  bar_index, e,  color = colE,  width = 1)
     tr.lnS := line.new(bar_index, s,  bar_index, s,  color = cBear, width = 2)
@@ -830,6 +1182,9 @@ if array.size(trades) > 0
             label.set_x(t.lb2, bar_index)
             label.set_x(t.lb3, bar_index)
             label.set_x(t.lbR, bar_index)
+            t.held := bar_index - t.bar
+            if t.risk > 0
+                t.mfe := math.max(t.mfe, ((t.dir == 1 ? high : low) - t.entry) / t.risk * t.dir)
             bool slHit  = t.dir == 1 ? low <= t.sl : high >= t.sl
             bool finHit = t.dir == 1 ? high >= t.fin : low <= t.fin
             int  hitNow = t.tpHit
@@ -842,11 +1197,19 @@ if array.size(trades) > 0
             if hitNow > t.tpHit
                 tpJustHit := true
             t.tpHit := hitNow
+            bool atBE = useBE and t.tpHit >= 1 and t.sl == t.entry
             if slHit
                 slJustHit := true
-                f_close(t, t.tpHit >= 1 ? "TP" + str.tostring(t.tpHit) + " → SL" : "SL HIT", cBear, t.sl)
+                f_close(t, atBE ? "TP" + str.tostring(t.tpHit) + " → BE" : t.tpHit >= 1 ? "TP" + str.tostring(t.tpHit) + " → SL" : "SL HIT", atBE ? cNeut : cBear, t.sl)
             else if finHit
                 f_close(t, "TARGET  +" + str.tostring(t.risk > 0 ? (t.fin - t.entry) / t.risk * t.dir : 0.0, "0.0") + "R", cBull, t.fin)
+            // from the next bar the first target protects the trade
+            if t.active and useBE and t.tpHit >= 1 and t.sl != t.entry
+                t.sl := t.entry
+                line.set_xy1(t.lnS, t.bar, t.entry)
+                line.set_xy2(t.lnS, bar_index, t.entry)
+                line.set_style(t.lnS, line.style_dotted)
+                label.set_text(t.lbS, "BE STOP " + str.tostring(t.entry, format.mintick))
 
 // ── summary for the dashboard and alert messages ──
 int   openCount = 0
@@ -883,6 +1246,18 @@ f_swingInfo(int t, bool isHigh) =>
     color  col = t == 1 ? cBull : t == -1 ? cBear : cNeut
     bool   vis = typeOn or showSwingPts
     [typeOn ? txt : "•", col, vis]
+
+f_setLvl(line ln, label lb, float px, int x1, string txt, color col, int fade) =>
+    if na(px)
+        line.set_color(ln, color.new(col, 100))
+        label.set_text(lb, "")
+    else
+        line.set_xy1(ln, x1, px)
+        line.set_xy2(ln, bar_index, px)
+        line.set_color(ln, color.new(col, fade))
+        label.set_xy(lb, bar_index, px)
+        label.set_text(lb, txt)
+        label.set_textcolor(lb, col)
 
 var label lastHiLbl = na
 var label lastLoLbl = na
@@ -962,6 +1337,14 @@ if showSweepLbl and cSweepLow and not watchBull
     bool bearCtx = cPrevState == -1 or cPrevState == 2
     label.new(bar_index, low, bearCtx ? "BULLISH SWEEP" : "FAILED BEAR BREAK", style = label.style_label_up, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
 
+// ── external liquidity taken ──
+if showLiq and showERL and extLoEvt
+    label.new(bar_index, low, "ERL SWEPT ▼", style = label.style_label_up, color = color.new(cBull, 60), textcolor = color.white, size = size.tiny,
+         tooltip = "The higher-timeframe swing low has been reached. Sell-side liquidity there is now filled, so shorts are held for " + str.tostring(extSweepBars) + " bars and this counts as bullish reversal evidence.")
+if showLiq and showERL and extHiEvt
+    label.new(bar_index, high, "ERL SWEPT ▲", style = label.style_label_down, color = color.new(cBear, 60), textcolor = color.white, size = size.tiny,
+         tooltip = "The higher-timeframe swing high has been reached. Buy-side liquidity there is now filled, so longs are held for " + str.tostring(extSweepBars) + " bars and this counts as bearish reversal evidence.")
+
 // ── stage-1 reversal watch markers ──
 if showWatch and watchBull
     label.new(bar_index, low, "REV WATCH ▲" + (cSweepLow ? " · SWEEP" : cLoEvt > 0 ? " · HL" : ""), style = label.style_label_up, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bearish structure showing bullish reversal evidence (HL and/or sweep). No trade yet – wait for the break of the last LH.")
@@ -983,6 +1366,16 @@ if showSignals and (longRetest or shortRetest or longPB or shortPB)
     label.new(bar_index, isL ? low : high, tPb, style = isL ? label.style_label_up : label.style_label_down,
          color = isL ? cBull : cBear, textcolor = color.white, size = size.small,
          tooltip = f_strength(sigScore) + " (" + str.tostring(sigScore) + ")\n" + sigBreak + sltpTip)
+if showSignals and (longFVG or shortFVG)
+    string tFv = (longFVG ? "LONG FVG" : "SHORT FVG") + (showScore ? "  " + str.tostring(sigScore) : "")
+    label.new(bar_index, longFVG ? low : high, tFv, style = longFVG ? label.style_label_up : label.style_label_down,
+         color = longFVG ? cBull : cBear, textcolor = color.white, size = size.small,
+         tooltip = "Entry on the retracement into the gap left by the displacement leg.\n" + sigBreak + sltpTip)
+if showSignals and (longScalp or shortScalp)
+    string tSc = (longScalp ? "↑ LONG SCALP" : "↓ SHORT SCALP") + (showScore ? "  " + str.tostring(sigScore) : "")
+    label.new(bar_index, longScalp ? low : high, tSc, style = longScalp ? label.style_label_up : label.style_label_down,
+         color = color.new(longScalp ? cBull : cBear, 45), textcolor = color.white, size = size.small,
+         tooltip = "Counter-trend scalp inside the higher-timeframe range.\nHTF stays " + f_stateText(hSt) + ", this targets internal liquidity only.\n" + sigBreak + sltpTip)
 if showWeak and (weakLong or weakShort)
     label.new(bar_index, weakLong ? low : high, str.tostring(weakScore), style = weakLong ? label.style_label_up : label.style_label_down,
          color = color.new(cNeut, 70), textcolor = color.white, size = size.tiny, tooltip = "Setup below the minimum score")
@@ -1018,6 +1411,16 @@ var line  loPrevLvl = na
 var label hiLvlLbl  = na
 var label loLvlLbl  = na
 var label devLbl    = na
+var box   fvgBoxU   = na
+var box   fvgBoxD   = na
+var line  erlHiLn   = na
+var line  erlLoLn   = na
+var line  irlHiLn   = na
+var line  irlLoLn   = na
+var label erlHiLb   = na
+var label erlLoLb   = na
+var label irlHiLb   = na
+var label irlLoLb   = na
 
 if barstate.islast
     if showLevels
@@ -1054,6 +1457,31 @@ if barstate.islast
             line.set_xy1(loPrevLvl, cSLPrevBar, cSLPrev)
             line.set_xy2(loPrevLvl, bar_index, cSLPrev)
             line.set_color(loPrevLvl, color.new(cBull, 70))
+    if showLiq
+        if na(erlHiLn)
+            erlHiLn := line.new(bar_index, close, bar_index, close, width = 2)
+            erlLoLn := line.new(bar_index, close, bar_index, close, width = 2)
+            irlHiLn := line.new(bar_index, close, bar_index, close, width = 1, style = line.style_dotted)
+            irlLoLn := line.new(bar_index, close, bar_index, close, width = 1, style = line.style_dotted)
+            erlHiLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+            erlLoLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+            irlHiLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+            irlLoLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+        int lx = bar_index - math.min(bar_index, 300)
+        f_setLvl(erlHiLn, erlHiLb, showERL ? hSH : na, lx, "ERL HIGH · " + f_tfLabel(tfHTF), cBear, 25)
+        f_setLvl(erlLoLn, erlLoLb, showERL ? hSL : na, lx, "ERL LOW · " + f_tfLabel(tfHTF), cBull, 25)
+        f_setLvl(irlHiLn, irlHiLb, showIRL ? irlUp : na, lx, "IRL ↑", cWatch, 40)
+        f_setLvl(irlLoLn, irlLoLb, showIRL ? irlDn : na, lx, "IRL ↓", cWatch, 40)
+    if showFVG
+        if na(fvgBoxU)
+            fvgBoxU := box.new(bar_index, close, bar_index, close, border_width = 0)
+            fvgBoxD := box.new(bar_index, close, bar_index, close, border_width = 0)
+        box.set_lefttop(fvgBoxU, na(fvgUpBar) ? bar_index : fvgUpBar, na(fvgUpTop) ? close : fvgUpTop)
+        box.set_rightbottom(fvgBoxU, bar_index, na(fvgUpBot) ? close : fvgUpBot)
+        box.set_bgcolor(fvgBoxU, color.new(cBull, not fvgUpUsed and not na(fvgUpTop) ? 88 : 100))
+        box.set_lefttop(fvgBoxD, na(fvgDnBar) ? bar_index : fvgDnBar, na(fvgDnTop) ? close : fvgDnTop)
+        box.set_rightbottom(fvgBoxD, bar_index, na(fvgDnBot) ? close : fvgDnBot)
+        box.set_bgcolor(fvgBoxD, color.new(cBear, not fvgDnUsed and not na(fvgDnTop) ? 88 : 100))
     if showDevSwing and not na(devPx)
         if na(devLbl)
             devLbl := label.new(bar_index, close, "", color = color.new(color.white, 100), size = size.tiny, textcolor = cNeut)
@@ -1080,7 +1508,7 @@ f_dashSz() =>
         "Normal" => size.normal
         => size.small
 
-var table dash = table.new(f_dashPos(), 3, 12, bgcolor = color.new(#131722, 10), frame_color = color.new(cNeut, 30), frame_width = 1, border_color = color.new(cNeut, 80), border_width = 1)
+var table dash = table.new(f_dashPos(), 3, 13, bgcolor = color.new(#131722, 10), frame_color = color.new(cNeut, 30), frame_width = 1, border_color = color.new(cNeut, 80), border_width = 1)
 var bool  dashMerged = false
 
 f_tfRow(int row, string name, int st, int ht, int lt, int bsB, int bsS, bool isChart, string sz) =>
@@ -1099,7 +1527,7 @@ if showDash and barstate.islast
         table.merge_cells(dash, 1, 7, 2, 7)
         table.merge_cells(dash, 1, 9, 2, 9)
         table.merge_cells(dash, 1, 10, 2, 10)
-        table.merge_cells(dash, 0, 11, 2, 11)
+        table.merge_cells(dash, 0, 12, 2, 12)
         dashMerged := true
     // title + header
     table.cell(dash, 0, 0, "MARKET STRUCTURE · " + syminfo.ticker, text_color = color.white, text_size = sz, bgcolor = color.new(cNeut, 55))
@@ -1111,14 +1539,17 @@ if showDash and barstate.islast
     f_tfRow(3, f_tfLabel(tfMTF),   mSt, mHt, mLt, mBB, mSB, tfMTF == timeframe.period, sz)
     f_tfRow(4, f_tfLabel(tfLTF),   lSt, lHt, lLt, lBB, lSB, tfLTF == timeframe.period, sz)
     f_tfRow(5, f_tfLabel(tfENTRY), eSt, eHt, eLt, eBB, eSB, chartIsEntry, sz)
+    if useEntryTF and (not entryOKLong or not entryOKShort)
+        table.cell(dash, 0, 5, f_tfLabel(tfENTRY) + (chartIsEntry ? " ●" : "") + (not entryOKLong ? " ⛔▲" : " ⛔▼"), text_color = cWatch, text_size = sz, text_halign = text.align_left)
     // bias
     color biasCol = str.contains(biasText, "REVERSAL") ? cWatch : biasDir > 0 ? cBull : biasDir < 0 ? cBear : cNeut
     table.cell(dash, 0, 6, "MULTI-TF BIAS", text_color = color.white, text_size = sz, text_halign = text.align_left)
     table.cell(dash, 1, 6, biasText, text_color = biasCol, text_size = sz, bgcolor = color.new(biasCol, 80))
     // condition
     string cond = chop ? "NO TRADE — CHOP" : useSessFilt and not sessOK ? "NO TRADE — OFF SESSION" :
+         useRangeBlock and boxed ? "RANGE — fade only" :
          not cooldownOK ? "COOLDOWN · " + str.tostring(minBarsSig - (bar_index - lastSigBar)) + " bars" : "TRADEABLE"
-    color condCol = chop or (useSessFilt and not sessOK) ? cBear : not cooldownOK ? cWatch : cBull
+    color condCol = chop or (useSessFilt and not sessOK) ? cBear : (useRangeBlock and boxed) or not cooldownOK ? cWatch : cBull
     table.cell(dash, 0, 7, "CONDITION", text_color = color.white, text_size = sz, text_halign = text.align_left)
     table.cell(dash, 1, 7, cond, text_color = condCol, text_size = sz, bgcolor = color.new(condCol, 82))
     // session / momentum / volatility
@@ -1141,10 +1572,97 @@ if showDash and barstate.islast
         trCol := lastTr.active ? (lr >= 0 ? cBull : cBear) : (str.contains(lastTr.res, "SL") ? cBear : cBull)
     table.cell(dash, 0, 10, openCount > 1 ? "TRADE · " + str.tostring(openCount) + " OPEN " + str.tostring(openR, "+0.0;-0.0") + "R" : openCount == 1 ? "TRADE · OPEN" : "TRADE", text_color = color.white, text_size = sz, text_halign = text.align_left)
     table.cell(dash, 1, 10, trTxt, text_color = trCol, text_size = sz, bgcolor = color.new(trCol, 88))
+    // liquidity map
+    string liqLvl = "—"
+    if not na(irlUp) or not na(irlDn)
+        liqLvl := (na(irlUp) ? "" : "↑ " + str.tostring(irlUp, format.mintick)) + (na(irlUp) or na(irlDn) ? "" : "   ") + (na(irlDn) ? "" : "↓ " + str.tostring(irlDn, format.mintick))
+    else if htfRangeOK
+        liqLvl := str.tostring(hSL, format.mintick) + " – " + str.tostring(hSH, format.mintick)
+    color liqCol = str.contains(liqPhase, "SWEEP") or str.contains(liqPhase, "counter") ? cWatch : str.contains(liqPhase, "EXTERNAL") ? cBull : cNeut
+    table.cell(dash, 0, 11, "LIQUIDITY", text_color = color.white, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 11, liqPhase, text_color = liqCol, text_size = sz)
+    table.cell(dash, 2, 11, liqLvl, text_color = color.new(color.white, 20), text_size = sz)
     // chart note
     string note = chartIsEntry ? "Signals on " + f_tfLabel(timeframe.period) + " · min score " + str.tostring(minScore) :
          "Chart " + f_tfLabel(timeframe.period) + " ≠ entry " + f_tfLabel(tfENTRY) + " · signals use chart TF"
-    table.cell(dash, 0, 11, note, text_color = chartIsEntry ? cNeut : cWatch, text_size = sz)
+    table.cell(dash, 0, 12, note, text_color = chartIsEntry ? cNeut : cWatch, text_size = sz)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 16b. TRADE DIAGNOSTICS  (optional) — every closed position, newest first.
+//      BEST R is how far it ever ran in your favour. A loser whose best is under
+//      half a unit of risk was wrong at entry; no stop or trail would have saved it.
+// ──────────────────────────────────────────────────────────────────────────────
+var table diag = table.new(position.bottom_left, 7, 23, bgcolor = color.new(#0f1218, 5), frame_color = color.new(cNeut, 40), frame_width = 1, border_color = color.new(cNeut, 75), border_width = 1)
+
+if showDiag and barstate.islast and array.size(trades) > 0
+
+    int   nWin = 0
+    int   nLos = 0
+    int   nBE  = 0
+    float sumR = 0.0
+    for i = 0 to array.size(trades) - 1
+        Trade t = array.get(trades, i)
+        if not t.active
+            sumR += t.rR
+            if t.rR > 0.05
+                nWin += 1
+            else if t.rR < -0.05
+                nLos += 1
+            else
+                nBE += 1
+    int nTot = nWin + nLos + nBE
+    float wr = nTot > 0 ? nWin * 100.0 / nTot : 0.0
+    color sumc = sumR > 0 ? cBull : cBear
+    table.cell(diag, 0, 0, "CLOSED", text_color = cNeut, text_size = size.tiny)
+    table.cell(diag, 1, 0, str.tostring(nTot), text_color = color.new(color.white, 15), text_size = size.tiny)
+    table.cell(diag, 2, 0, "WIN " + str.tostring(wr, "0") + "%", text_color = wr >= 50 ? cBull : cWatch, text_size = size.tiny)
+    table.cell(diag, 3, 0, str.tostring(nWin) + "W " + str.tostring(nLos) + "L " + str.tostring(nBE) + "BE", text_color = color.new(color.white, 25), text_size = size.tiny)
+    table.cell(diag, 4, 0, "NET " + str.tostring(sumR, "+0.0;-0.0") + "R", text_color = sumc, text_size = size.tiny, bgcolor = color.new(sumc, 80))
+    table.cell(diag, 5, 0, "", text_color = cNeut, text_size = size.tiny)
+    table.cell(diag, 6, 0, "expectancy " + str.tostring(nTot > 0 ? sumR / nTot : 0.0, "0.00") + "R per trade", text_color = sumc, text_size = size.tiny)
+    int row = 1
+    for i = array.size(trades) - 1 to 0
+        Trade t = array.get(trades, i)
+        if not t.active and row < 20
+            row += 1
+            color rc = str.contains(t.res, "SL") ? cBear : cBull
+            table.cell(diag, 0, row, str.tostring(row), text_color = cNeut, text_size = size.tiny)
+            table.cell(diag, 1, row, t.kind, text_color = t.dir == 1 ? cBull : cBear, text_size = size.tiny)
+            table.cell(diag, 2, row, str.tostring(t.score), text_color = color.new(color.white, 15), text_size = size.tiny)
+            table.cell(diag, 3, row, t.res, text_color = rc, text_size = size.tiny, bgcolor = color.new(rc, 85))
+            table.cell(diag, 4, row, str.tostring(t.mfe, "0.00"), text_color = t.mfe >= 1.0 ? cBull : cWatch, text_size = size.tiny)
+            table.cell(diag, 5, row, str.tostring(t.held), text_color = color.new(color.white, 30), text_size = size.tiny)
+            table.cell(diag, 6, row, t.ctx, text_color = color.new(color.white, 30), text_size = size.tiny)
+
+// ── gate audit table ──────────────────────────────────────────────────────
+var table audit = table.new(position.middle_right, 3, 15, bgcolor = color.new(#0f1218, 5), frame_color = color.new(cNeut, 40), frame_width = 1, border_color = color.new(cNeut, 75), border_width = 1)
+
+f_auditRow(int row, string name, int hits, int total) =>
+    float pct = total > 0 ? hits * 100.0 / total : 0.0
+    color c = pct >= 40 ? cBear : pct >= 15 ? cWatch : color.new(color.white, 45)
+    table.cell(audit, 0, row, name, text_color = color.new(color.white, 25), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(audit, 1, row, str.tostring(hits), text_color = c, text_size = size.tiny)
+    table.cell(audit, 2, row, str.tostring(pct, "0") + "%", text_color = c, text_size = size.tiny)
+
+if showDiag and barstate.islast
+    table.cell(audit, 0, 0, "REFUSED BY", text_color = cNeut, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(audit, 1, 0, "N", text_color = cNeut, text_size = size.tiny)
+    table.cell(audit, 2, 0, "OF SETUPS", text_color = cNeut, text_size = size.tiny)
+    f_auditRow(1,  "score",          auScore,  auCand)
+    f_auditRow(2,  "HTF opposed",    auHtf,    auCand)
+    f_auditRow(3,  "entry TF veto",  auEntry,  auCand)
+    f_auditRow(4,  "external sweep", auSweep,  auCand)
+    f_auditRow(5,  "premium/discount", auZone, auCand)
+    f_auditRow(6,  "no room to run", auTarget, auCand)
+    f_auditRow(7,  "ADX",            auAdx,    auCand)
+    f_auditRow(8,  "pool too close", auRoom,   auCand)
+    f_auditRow(9,  "price spacing",  auSpace,  auCand)
+    f_auditRow(10, "range block",    auRange,  auCand)
+    f_auditRow(11, "chop",           auChop,   auCand)
+    f_auditRow(12, "cooldown",       auCool,   auCand)
+    table.cell(audit, 0, 13, "SETUPS SEEN", text_color = cNeut, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(audit, 1, 13, str.tostring(auCand), text_color = color.new(color.white, 20), text_size = size.tiny)
+    table.cell(audit, 2, 13, str.tostring(auTaken) + " taken", text_color = cBull, text_size = size.tiny)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 17. ALERTS
@@ -1164,6 +1682,12 @@ alertcondition(tpJustHit,   "Take Profit Hit",          "{{ticker}} take profit 
 alertcondition(slJustHit,   "Stop Loss Hit",            "{{ticker}} stop loss hit | {{interval}} | price {{close}}")
 alertcondition(longRetest or longPB,   "LONG Pullback / Retest",  "{{ticker}} LONG pullback entry | {{interval}} | price {{close}}")
 alertcondition(shortRetest or shortPB, "SHORT Pullback / Retest", "{{ticker}} SHORT pullback entry | {{interval}} | price {{close}}")
+alertcondition(longScalp,   "LONG Scalp (internal liquidity)",  "{{ticker}} counter-trend LONG scalp | {{interval}} | price {{close}}")
+alertcondition(shortScalp,  "SHORT Scalp (internal liquidity)", "{{ticker}} counter-trend SHORT scalp | {{interval}} | price {{close}}")
+alertcondition(extLoEvt,    "External Low Swept",  "{{ticker}} HTF swing low taken | {{interval}} | price {{close}}")
+alertcondition(extHiEvt,    "External High Swept", "{{ticker}} HTF swing high taken | {{interval}} | price {{close}}")
+alertcondition(longFVG,     "LONG Fair Value Gap",  "{{ticker}} LONG gap entry | {{interval}} | price {{close}}")
+alertcondition(shortFVG,    "SHORT Fair Value Gap", "{{ticker}} SHORT gap entry | {{interval}} | price {{close}}")
 
 f_mtfMsg() =>
     f_tfLabel(tfHTF) + " " + f_stateText(hSt) + " | " + f_tfLabel(tfMTF) + " " + f_stateText(mSt) + " | " +
