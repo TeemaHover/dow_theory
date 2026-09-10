@@ -1846,3 +1846,47 @@ else if cBullBOS or cBearBOS
     alert(syminfo.ticker + (cBullBOS ? " BULLISH BOS" : " BEARISH BOS") + (cRevBull or cRevBear ? " (reversal)" : "") + " | " + f_mtfMsg(), alert.freq_once_per_bar_close)
 if strongBullA or strongBearA
     alert(syminfo.ticker + (strongBullA ? " STRONG BULLISH ALIGNMENT" : " STRONG BEARISH ALIGNMENT") + " | " + f_mtfMsg(), alert.freq_once_per_bar_close)
+
+// ============================================================================
+// ROBUSTNESS PANEL (backtest build only)
+// A high profit factor carried by two or three enormous winners is a sample,
+// not an edge. This reports the same result with the largest winners removed.
+// ============================================================================
+var table rob = table.new(position.middle_left, 2, 9, border_width = 1, frame_width = 1)
+
+f_robRow(int r, string k, string v, color c) =>
+    table.cell(rob, 0, r, k, text_color = color.white, text_size = size.small, bgcolor = color.new(color.black, 15), text_halign = text.align_left)
+    table.cell(rob, 1, r, v, text_color = c, text_size = size.small, bgcolor = color.new(color.black, 15), text_halign = text.align_right)
+
+if barstate.islast
+    float gp = strategy.grossprofit
+    float gl = strategy.grossloss
+    int   nT = strategy.closedtrades
+    float w1 = 0.0
+    float w2 = 0.0
+    float w3 = 0.0
+    if nT > 0
+        for i = 0 to nT - 1
+            float p = strategy.closedtrades.profit(i)
+            if p > w1
+                w3 := w2
+                w2 := w1
+                w1 := p
+            else if p > w2
+                w3 := w2
+                w2 := p
+            else if p > w3
+                w3 := p
+    float pfAll = gl > 0 ? gp / gl : na
+    float pfEx1 = gl > 0 ? (gp - w1) / gl : na
+    float pfEx3 = gl > 0 ? (gp - w1 - w2 - w3) / gl : na
+    float share = gp > 0 ? (w1 + w2 + w3) / gp * 100 : na
+    f_robRow(0, "ROBUSTNESS", str.tostring(nT) + " trades", color.yellow)
+    f_robRow(1, "Wins / Losses", str.tostring(strategy.wintrades) + " / " + str.tostring(strategy.losstrades), color.white)
+    f_robRow(2, "Gross profit", str.tostring(gp, "#.0"), color.lime)
+    f_robRow(3, "Gross loss", str.tostring(gl, "#.0"), color.red)
+    f_robRow(4, "Profit factor", str.tostring(pfAll, "#.000"), pfAll > 1 ? color.lime : color.red)
+    f_robRow(5, "Largest win", str.tostring(w1, "#.0"), color.lime)
+    f_robRow(6, "Top 3 share of gross", str.tostring(share, "#.0") + "%", share > 60 ? color.red : color.white)
+    f_robRow(7, "PF without top 1", str.tostring(pfEx1, "#.000"), pfEx1 > 1 ? color.lime : color.red)
+    f_robRow(8, "PF without top 3", str.tostring(pfEx3, "#.000"), pfEx3 > 1 ? color.lime : color.red)

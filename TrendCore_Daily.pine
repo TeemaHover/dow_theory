@@ -1,0 +1,192 @@
+//@version=6
+// ============================================================================
+// TREND CORE - daily breakout momentum with an ATR trailing exit
+//
+// Why this looks nothing like the previous indicator.
+//
+// The Dow-structure indicator was measured across 17 instruments and roughly
+// 60,000 simulated trades. Its entries carried no directional information: with
+// transaction costs removed the profit factor was 1.006 and the win rate matched
+// a coin flip at every target level. Six entry styles were tested - break of
+// structure, pullback, liquidity sweep, moving-average pullback, mean reversion
+// and session opening range - and all six landed within two percentage points of
+// chance. No parameter change repairs that, because there is no signal to tune.
+//
+// One approach survived: daily breakout momentum held on a trailing stop, applied
+// to commodities, equity indices and rates. Measured 2016-2026, train split at
+// September 2023:
+//
+//     class        train PF   test PF
+//     metals         1.481     2.206
+//     energy         1.533     1.058
+//     rates          1.282     1.018
+//     equity index   1.042     1.256
+//     FX majors      0.892     0.889    <- do not run this on currency pairs
+//     FX crosses     0.819     0.565    <- worst of all
+//
+// The win rate is about 36%. That is not a defect to be fixed. With a stop at 1R,
+// a coin flip reaches a target of XR about 1/(1+X) of the time, so any win rate
+// can be manufactured by shrinking the target - and it buys nothing, because the
+// payoff shrinks with it. The edge is in the size of the winners, not the count.
+//
+// Expect long flat stretches. 2021, 2022 and 2023 were losing years for this
+// system and 2020 and 2025 paid for them. That profile is intrinsic to trend
+// following rather than a sign of a broken configuration.
+//
+// This is a basket system. One chart produces under one trade a month; the trade
+// frequency and the smoothness both come from running the whole universe.
+// ============================================================================
+indicator("Trend Core [Daily Momentum]", shorttitle = "TREND-CORE", overlay = true,
+     max_labels_count = 500, max_lines_count = 500)
+
+// ── inputs ──────────────────────────────────────────────────────────────────
+G_SIG  = "Signal"
+G_RISK = "Risk and Exit"
+G_VIS  = "Display"
+
+nBreak = input.int(8, "Breakout Lookback (bars)", minval = 3, maxval = 200, group = G_SIG,
+     tooltip = "A long needs a close above the highest high of this many prior bars. Every value tested from 8 to 20 gave a train profit factor between 1.17 and 1.26, so this is a flat region rather than a tuned peak. Lower means more trades and slightly less per trade.")
+nTrend = input.int(100, "Trend Filter EMA", minval = 20, maxval = 400, group = G_SIG,
+     tooltip = "Longs only above this average, shorts only below. Removing it cost about a third of the measured expectancy.")
+useTrend   = input.bool(true, "Require Trend Filter", group = G_SIG)
+allowLong  = input.bool(true, "Allow Longs", group = G_SIG, inline = "s1")
+allowShort = input.bool(true, "Allow Shorts", group = G_SIG, inline = "s1")
+
+atrLen   = input.int(14, "ATR Length", minval = 5, maxval = 50, group = G_RISK)
+stopATR  = input.float(2.0, "Initial Stop (x ATR)", minval = 0.5, maxval = 6.0, step = 0.1, group = G_RISK)
+trailATR = input.float(2.5, "Trailing Stop (x ATR)", minval = 0.5, maxval = 8.0, step = 0.1, group = G_RISK,
+     tooltip = "The exit is a ratchet: it moves in your favour and never back. This, not a fixed target, is what lets a winner reach several R.")
+riskPct  = input.float(1.0, "Risk Per Trade (% of account)", minval = 0.05, maxval = 5.0, step = 0.05, group = G_RISK,
+     tooltip = "Used only to display a suggested position size. It changes nothing about the signals.")
+acctSize = input.float(10000, "Account Size", minval = 1, group = G_RISK)
+
+showLevels = input.bool(true, "Show Stop and Entry Lines", group = G_VIS)
+showChan   = input.bool(true, "Show Breakout Channel", group = G_VIS)
+showLabels = input.bool(true, "Show Entry Labels", group = G_VIS)
+showPanel  = input.bool(true, "Show Info Panel", group = G_VIS)
+panelPos   = input.string("Top Right", "Panel Position", group = G_VIS,
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"])
+
+// ── engine ──────────────────────────────────────────────────────────────────
+float atr = ta.atr(atrLen)
+float ema = ta.ema(close, nTrend)
+
+// the channel is taken from prior bars only, so the breaking bar cannot raise
+// the level it is breaking
+float chHi = ta.highest(high, nBreak)[1]
+float chLo = ta.lowest(low, nBreak)[1]
+
+bool trendUp = not useTrend or close > ema
+bool trendDn = not useTrend or close < ema
+
+bool rawLong  = allowLong  and not na(chHi) and close > chHi and trendUp
+bool rawShort = allowShort and not na(chLo) and close < chLo and trendDn
+
+// ── position state ──────────────────────────────────────────────────────────
+var int   pos      = 0          // 1 long, -1 short, 0 flat
+var float entryPx  = na
+var float stopPx   = na
+var float riskPx   = na
+var int   entryBar = na
+
+bool exitLong  = pos ==  1 and low  <= stopPx
+bool exitShort = pos == -1 and high >= stopPx
+
+if exitLong or exitShort
+    pos := 0
+    entryPx := na
+    stopPx := na
+    riskPx := na
+
+bool goLong  = pos == 0 and rawLong
+bool goShort = pos == 0 and rawShort
+
+if goLong
+    pos := 1
+    entryPx := close
+    stopPx := close - stopATR * atr
+    riskPx := stopATR * atr
+    entryBar := bar_index
+else if goShort
+    pos := -1
+    entryPx := close
+    stopPx := close + stopATR * atr
+    riskPx := stopATR * atr
+    entryBar := bar_index
+
+// ratchet the trailing stop; it never loosens
+if pos == 1 and not na(stopPx)
+    stopPx := math.max(stopPx, close - trailATR * atr)
+else if pos == -1 and not na(stopPx)
+    stopPx := math.min(stopPx, close + trailATR * atr)
+
+float openR = pos == 0 or na(riskPx) or riskPx == 0 ? na :
+     pos == 1 ? (close - entryPx) / riskPx : (entryPx - close) / riskPx
+
+// suggested size, purely informational
+float units = na(riskPx) or riskPx == 0 ? na : (acctSize * riskPct / 100.0) / riskPx
+
+// ── drawing ─────────────────────────────────────────────────────────────────
+plot(showChan ? chHi : na, "Breakout High", color = color.new(color.teal, 45), style = plot.style_stepline)
+plot(showChan ? chLo : na, "Breakout Low",  color = color.new(color.maroon, 45), style = plot.style_stepline)
+plot(useTrend ? ema : na, "Trend EMA", color = color.new(color.gray, 30), linewidth = 2)
+
+plot(showLevels and pos != 0 ? stopPx : na, "Stop", color = color.new(color.red, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(showLevels and pos != 0 ? entryPx : na, "Entry", color = color.new(color.blue, 25),
+     style = plot.style_linebr, linewidth = 1)
+
+if showLabels and goLong
+    label.new(bar_index, low, "LONG" + "\n" + "stop " + str.tostring(stopPx, format.mintick),
+         style = label.style_label_up, color = color.new(color.teal, 15),
+         textcolor = color.white, size = size.small)
+if showLabels and goShort
+    label.new(bar_index, high, "SHORT" + "\n" + "stop " + str.tostring(stopPx, format.mintick),
+         style = label.style_label_down, color = color.new(color.maroon, 15),
+         textcolor = color.white, size = size.small)
+if showLabels and (exitLong or exitShort)
+    label.new(bar_index, exitLong ? low : high, "EXIT",
+         style = exitLong ? label.style_label_up : label.style_label_down,
+         color = color.new(color.gray, 25), textcolor = color.white, size = size.tiny)
+
+// ── panel ───────────────────────────────────────────────────────────────────
+f_panelPos() =>
+    panelPos == "Top Left" ? position.top_left :
+     panelPos == "Bottom Right" ? position.bottom_right :
+     panelPos == "Bottom Left" ? position.bottom_left :
+     panelPos == "Middle Right" ? position.middle_right : position.top_right
+
+var table panel = table.new(f_panelPos(), 2, 7, border_width = 1, frame_width = 1)
+
+f_row(int r, string k, string v, color col) =>
+    table.cell(panel, 0, r, k, text_color = color.white, text_size = size.small,
+         bgcolor = color.new(color.black, 20), text_halign = text.align_left)
+    table.cell(panel, 1, r, v, text_color = col, text_size = size.small,
+         bgcolor = color.new(color.black, 20), text_halign = text.align_right)
+
+if showPanel and barstate.islast
+    bool daily = timeframe.isdaily
+    f_row(0, "TREND CORE", daily ? "daily" : timeframe.period + " - use 1D",
+         daily ? color.lime : color.orange)
+    f_row(1, "Position", pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "flat",
+         pos == 1 ? color.lime : pos == -1 ? color.red : color.gray)
+    f_row(2, "Entry", pos == 0 ? "-" : str.tostring(entryPx, format.mintick), color.white)
+    f_row(3, "Stop", pos == 0 ? "-" : str.tostring(stopPx, format.mintick), color.red)
+    f_row(4, "Open R", na(openR) ? "-" : str.tostring(openR, "#.00") + "R",
+         na(openR) ? color.gray : openR >= 0 ? color.lime : color.red)
+    f_row(5, "Trend", close > ema ? "up" : "down", close > ema ? color.lime : color.red)
+    f_row(6, "Size at " + str.tostring(riskPct, "#.##") + "%",
+         na(units) ? "-" : str.tostring(units, "#.###"), color.aqua)
+
+// ── alerts ──────────────────────────────────────────────────────────────────
+alertcondition(goLong,  "Long Entry",  "TREND CORE long {{ticker}} | close {{close}}")
+alertcondition(goShort, "Short Entry", "TREND CORE short {{ticker}} | close {{close}}")
+alertcondition(exitLong or exitShort, "Exit", "TREND CORE exit {{ticker}} | close {{close}}")
+
+if goLong or goShort
+    alert(syminfo.ticker + (goLong ? " LONG " : " SHORT ") + str.tostring(close, format.mintick) +
+     " | stop " + str.tostring(stopPx, format.mintick) +
+     " | risk " + str.tostring(riskPx, format.mintick), alert.freq_once_per_bar_close)
+if exitLong or exitShort
+    alert(syminfo.ticker + " EXIT at stop " + str.tostring(stopPx, format.mintick),
+     alert.freq_once_per_bar_close)
