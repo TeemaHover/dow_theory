@@ -756,3 +756,144 @@ against a bearish 4-hour.
 
 Nine trades is not a sample to draw conclusions from. Treat the sign as encouraging and the magnitude as noise
 until there are several dozen.
+
+---
+
+## 24. Support and resistance, and the first real backtest
+
+### The S/R layer
+
+A single swing is one opinion. A price that several confirmed swings have turned at is a level. The engine now
+clusters confirmed swings into levels: a new swing within `Level Merge Tolerance` of an existing level joins it
+and raises its touch count, otherwise it starts a new one. Levels with at least `Touches To Count As A Level`
+touches are the ones that matter, and the nearest above and below are drawn as dashed lines tagged `RES x3`
+and `SUP x2`.
+
+It is used two ways:
+
+* **As a gate on every entry.** No buying with resistance within `Room To The Level`, no selling with support that
+  close. This applies to all twelve entry paths.
+* **As an entry of its own.** `Enable S/R Rejection Entries` fires `LONG S/R` or `SHORT S/R` when price wicks into
+  a proven level and closes back off it. It is the one entry that needs no break of structure first, and it
+  re-arms after `S/R Entry Re-Arm` bars so a level cannot fire repeatedly.
+
+### What the Strategy Tester says
+
+XAUUSD 15-minute, 1 June to 10 September 2026, 10K account, 100 percent of equity per trade, 0.005 percent
+commission, two ticks of slippage.
+
+| Configuration | Trades | Win rate | Profit factor | Net | Max drawdown |
+|---|---|---|---|---|---|
+| Before S/R | 28 | 32.1% | **0.802** | −2.72% | 7.56% |
+| With S/R | 18 | 22.2% | **2.451** | +5.81% | 4.68% |
+| With S/R, single 1R target | 19 | 26.3% | **2.583** | +6.35% | 4.51% |
+| With S/R, 0.3R target | 19 | 26.3% | **2.303** | +5.86% | 4.79% |
+
+The first two rows are a clean A/B on identical settings. **Support and resistance turned a losing system into a
+profitable one**, from a profit factor of 0.80 to 2.45, while cutting maximum drawdown by nearly half.
+
+### On the 65 percent win rate
+
+The same table is the argument against chasing it. The system got dramatically better while its win rate fell
+from 32 percent to 22 percent, because the filter removed far more losers than winners and the survivors run
+further. Profit factor, not win rate, is what pays.
+
+Rows three and four settle it empirically. Cutting the target from 1R to 0.3R did not move the win rate at all,
+5 of 19 either way, and profit factor fell. The losing trades are stopped out before they reach any target, so a
+smaller target only shrinks the winners. You cannot buy a higher win rate with target size in this system.
+
+A 65 percent win rate is reachable only by a system whose winners are smaller than its losers, and tuning
+parameters on this sample size until a number appears is curve fitting, which produces exactly the result that
+does not survive live. The honest target is expectancy: profit factor above 1.5 with drawdown you can sit
+through. This currently sits at 2.45 on 18 trades, which is encouraging and far too small a sample to trust.
+
+### One loose end
+
+A full settings reset produced 14 trades at profit factor 1.204 rather than the 18 at 2.451 measured minutes
+earlier with the same script. Some input differs between the chart's stored values and the code defaults and I
+did not isolate which before stopping. Treat the 2.451 figure as conditional on that configuration until it is
+reproduced from a clean reset.
+
+---
+
+## 25. Runtime bug: max_bars_back
+
+The indicator compiled cleanly and then drew nothing at all. No labels, no dashboard, no levels. TradingView
+surfaced the reason only as a small banner under the chart:
+
+```text
+Error on bar 6696: The requested historical offset (301) is beyond the historical buffer's limit (300)
+```
+
+Pine allocates a 300-bar history buffer when it cannot infer how far back a series is read. Something in the
+engine reaches past that, and the script dies silently at runtime rather than at compile time, which is why every
+check for a compile error came back clean.
+
+Both files now declare `max_bars_back = 1000` in their header. This is the documented remedy and costs nothing
+but memory.
+
+The lesson for this project: **a Pine script can compile, report no error, and still be completely dead.** From
+here, confirming a build means seeing it draw, not seeing it compile.
+
+### Which file to load
+
+| File | Load it on | Purpose |
+|---|---|---|
+| `DowTheory_MTF_XAUUSD_v2.pine` | your trading chart | the indicator, `DOW-MTF+L`, carries the alerts |
+| `DowTheory_MTF_XAUUSD_STRATEGY.pine` | a separate test chart | the backtest build, `DOW-BT`, feeds the Strategy Tester |
+
+They are not alternatives and neither is wrong. Running both on one chart doubles every drawing and is what
+produced the two entries in the legend.
+
+---
+
+## 26. Marker lanes
+
+Swing labels were being covered by the orange markers. In one place two `LH` labels appeared adjacent with
+nothing between them, which looked like a structure bug; the `LL` between them was simply hidden underneath a
+`REV WATCH` label.
+
+Every bar-anchored marker now sits in its own lane, measured outward from the bar's high or low:
+
+| Lane | Contents |
+|---|---|
+| 0 | swing labels, HH / HL / LH / LL / EQH / EQL, on the price itself |
+| 1 | entry signals |
+| 2 | sweeps and failed breaks |
+| 3 | reversal watch |
+| 4 | swept external liquidity |
+
+`Marker Lane Spacing (x ATR)` under Visualization sets the gap, 0.5 by default. Raise it if markers still crowd
+on a busy chart, set it to zero to stack everything on the price as before.
+
+Swing labels stay on the price because they are the reference everything else is read against. Nothing can now
+cover them.
+
+### The historical buffer error
+
+Four tests on the live chart, each one ruling something out:
+
+| Test | Result | Conclusion |
+|---|---|---|
+| Changed the only `300` in the code to 150 | error still read 301 against 300 | not my drawing lookback |
+| Raised `max_bars_back` from 1000 to 5000 | reported limit stayed 300 | the declaration never reaches that series |
+| Recompiled five materially different builds | error bar stayed 6702 every time | a live error would move |
+| Reloaded the page | error cleared completely | it is session state, not the running script |
+
+The weight of that points to a stale artifact left behind by the backtest script after it was removed from the
+chart, rather than a fault in the indicator. I could not prove it outright, because the Pine Editor stopped
+opening in that browser session before I could load the fixed build on a clean page.
+
+**To settle it:** open a fresh chart that has never had the strategy on it, paste the indicator, and add it. If no
+caution banner appears, it was the stale artifact.
+
+### Timeframe clamping, which is a real fix either way
+
+Chasing this exposed a genuine problem. On a 15-minute chart the indicator was calling `request.security` for a
+5-minute entry timeframe. Asking for a timeframe **finer** than the chart forces Pine to buffer that finer series,
+which costs performance and is a real way to exhaust the history buffer, and the declaration-level
+`max_bars_back` does not extend it.
+
+Every requested timeframe is now clamped so it is never finer than the chart. A row configured below the chart
+timeframe reads the chart's own structure instead, and the dashboard note says so. On a 5-minute chart nothing
+changes, since all four configured timeframes are equal or higher.

@@ -13,7 +13,7 @@
 //    • Signals are evaluated on bar close and never move once printed.
 // ══════════════════════════════════════════════════════════════════════════════
 strategy("DOW-MTF BACKTEST [XAUUSD]", shorttitle = "DOW-BT", overlay = true,
-     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500, max_bars_back = 1000,
      initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100,
      commission_type = strategy.commission.percent, commission_value = 0.005,
      slippage = 2, calc_on_every_tick = false, process_orders_on_close = true)
@@ -126,12 +126,23 @@ showTP3     = input.bool(true, "Show TP3", group = G_RISK, inline = "tpv")
 showRRBox   = input.bool(true, "Shade Risk / Reward Zones", group = G_RISK, inline = "tpv")
 useBE       = input.bool(true, "Move Stop To Entry After TP1", group = G_RISK,
      tooltip = "Once the first target trades, the stop moves to the entry price. Three of thirteen tracked positions reached a full unit of risk or more and then gave it all back; this turns those from losses into scratches without costing a single signal. Outcomes closed this way are tagged BE rather than SL.")
-keepDays    = input.int(30, "Keep Trades From Last (days)", minval = 1, maxval = 365, group = G_RISK,
+keepDays    = input.int(365, "Keep Trades From Last (days)", minval = 1, maxval = 365, group = G_RISK,
      tooltip = "Rolling retention window. Every position whose entry falls inside this window stays drawn, open or closed. Older ones are removed. 30 = about one month.")
-maxTrades   = input.int(60, "Safety Cap (max trades on chart)", minval = 1, maxval = 100, group = G_RISK,
+maxTrades   = input.int(100, "Safety Cap (max trades on chart)", minval = 1, maxval = 100, group = G_RISK,
      tooltip = "Hard ceiling so the script cannot run out of TradingView drawing objects. Lower it if the chart feels crowded; the retention window above is the rule that normally applies.")
 
 // Liquidity & Scalps ─────────────────────────────────────────────────────────
+useSR        = input.bool(true, "Support / Resistance Gate", group = G_LIQ,
+     tooltip = "A price that several confirmed swings have turned at is far stronger than a single swing. Entries are refused when a level of this strength sits in the way, closer than the room requirement below.")
+srMinTouch   = input.int(2, "Touches To Count As A Level", minval = 2, maxval = 6, group = G_LIQ)
+srTolATR     = input.float(0.35, "Level Merge Tolerance (x ATR)", minval = 0.05, step = 0.05, group = G_LIQ,
+     tooltip = "Swings within this distance of each other are treated as the same level and their touch count is combined.")
+srRoomATR    = input.float(1.0, "Room To The Level (x ATR)", minval = 0.1, step = 0.1, group = G_LIQ)
+useSREntry   = input.bool(true, "Enable S/R Rejection Entries", group = G_LIQ,
+     tooltip = "Price wicks into a proven level and closes back off it. The classic bounce, and the one entry that does not need a break of structure first.")
+srReArm      = input.int(25, "S/R Entry Re-Arm (bars)", minval = 3, maxval = 200, group = G_LIQ)
+srMax        = input.int(24, "Levels Remembered", minval = 6, maxval = 60, group = G_LIQ)
+showSR       = input.bool(true, "Draw Nearest Levels", group = G_LIQ)
 showLiq      = input.bool(true, "Show Liquidity Levels", group = G_LIQ)
 showERL      = input.bool(true, "External (HTF) Liquidity", group = G_LIQ, inline = "lq")
 showIRL      = input.bool(true, "Internal Liquidity", group = G_LIQ, inline = "lq")
@@ -185,6 +196,8 @@ showSweepLbl = input.bool(true,  "Sweep / Failed Break Labels", group = G_VIS, i
 showScore    = input.bool(true,  "Show Confidence Score", group = G_VIS, inline = "v7")
 showWeak     = input.bool(false, "Show Below-Threshold Setups (tiny)", group = G_VIS, inline = "v7")
 showChopBg   = input.bool(false, "Shade Chop Zones (background)", group = G_VIS, inline = "v8")
+labelGapATR  = input.float(0.5, "Marker Lane Spacing (x ATR)", minval = 0.0, maxval = 3.0, step = 0.1, group = G_VIS,
+     tooltip = "Swing labels sit on the price. Every other marker is pushed away from it in lanes so nothing covers an HH, HL, LH or LL. Lane 1 is signals, lane 2 sweeps and failed breaks, lane 3 reversal watch, lane 4 swept external liquidity. Set to 0 to stack everything on the price as before.")
 cBull        = input.color(#26a69a, "Bull", group = G_VIS, inline = "c")
 cBear        = input.color(#ef5350, "Bear", group = G_VIS, inline = "c")
 cNeut        = input.color(#9598a1, "Neutral", group = G_VIS, inline = "c")
@@ -237,6 +250,11 @@ f_tfLabel(string tf) =>
     else if sec < 604800
         out := str.tostring(sec / 86400) + "D"
     out
+
+// A request for a timeframe finer than the chart forces Pine to buffer that finer series,
+// and max_bars_back in the declaration does not extend it. Clamp to the chart timeframe.
+f_tfUse(string tf) =>
+    timeframe.in_seconds(tf) < timeframe.in_seconds(timeframe.period) ? timeframe.period : tf
 
 f_stateText(int st) =>
     switch st
@@ -482,10 +500,10 @@ f_secEngine() =>
 // ──────────────────────────────────────────────────────────────────────────────
 // 10. MULTI-TIMEFRAME CALCULATIONS  (exactly four requests, closed-bar data only)
 // ──────────────────────────────────────────────────────────────────────────────
-[hSt0, hHt0, hLt0, hBB0, hSB0, hRB0, hRS0, hSH0, hSL0] = request.security(syminfo.tickerid, tfHTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
-[mSt0, mHt0, mLt0, mBB0, mSB0, mRB0, mRS0, mSH0, mSL0] = request.security(syminfo.tickerid, tfMTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
-[lSt0, lHt0, lLt0, lBB0, lSB0, lRB0, lRS0, lSH0, lSL0] = request.security(syminfo.tickerid, tfLTF,   f_secEngine(), lookahead = barmerge.lookahead_on)
-[eSt0, eHt0, eLt0, eBB0, eSB0, eRB0, eRS0, eSH0, eSL0] = request.security(syminfo.tickerid, tfENTRY, f_secEngine(), lookahead = barmerge.lookahead_on)
+[hSt0, hHt0, hLt0, hBB0, hSB0, hRB0, hRS0, hSH0, hSL0] = request.security(syminfo.tickerid, f_tfUse(tfHTF),   f_secEngine(), lookahead = barmerge.lookahead_on)
+[mSt0, mHt0, mLt0, mBB0, mSB0, mRB0, mRS0, mSH0, mSL0] = request.security(syminfo.tickerid, f_tfUse(tfMTF),   f_secEngine(), lookahead = barmerge.lookahead_on)
+[lSt0, lHt0, lLt0, lBB0, lSB0, lRB0, lRS0, lSH0, lSL0] = request.security(syminfo.tickerid, f_tfUse(tfLTF),   f_secEngine(), lookahead = barmerge.lookahead_on)
+[eSt0, eHt0, eLt0, eBB0, eSB0, eRB0, eRS0, eSH0, eSL0] = request.security(syminfo.tickerid, f_tfUse(tfENTRY), f_secEngine(), lookahead = barmerge.lookahead_on)
 
 // A timeframe equal to the chart uses the live chart engine (no closed-bar offset needed)
 f_pick(string tf, int secVal, int localVal) =>
@@ -495,29 +513,29 @@ f_pickN(string tf, int secVal, int localVal) =>
 f_pickF(string tf, float secVal, float localVal) =>
     tf == timeframe.period ? localVal : secVal
 
-int hSt = f_pick(tfHTF, hSt0, cState)
-int hHt = f_pick(tfHTF, hHt0, cHiType)
-int hLt = f_pick(tfHTF, hLt0, cLoType)
-int hBB = f_pickN(tfHTF, hBB0, cBsBullBOS)
-int hSB = f_pickN(tfHTF, hSB0, cBsBearBOS)
-int mSt = f_pick(tfMTF, mSt0, cState)
-int mHt = f_pick(tfMTF, mHt0, cHiType)
-int mLt = f_pick(tfMTF, mLt0, cLoType)
-int mBB = f_pickN(tfMTF, mBB0, cBsBullBOS)
-int mSB = f_pickN(tfMTF, mSB0, cBsBearBOS)
-int lSt = f_pick(tfLTF, lSt0, cState)
-int lHt = f_pick(tfLTF, lHt0, cHiType)
-int lLt = f_pick(tfLTF, lLt0, cLoType)
-int lBB = f_pickN(tfLTF, lBB0, cBsBullBOS)
-int lSB = f_pickN(tfLTF, lSB0, cBsBearBOS)
-int eSt = f_pick(tfENTRY, eSt0, cState)
-int eHt = f_pick(tfENTRY, eHt0, cHiType)
-int eLt = f_pick(tfENTRY, eLt0, cLoType)
-int eBB = f_pickN(tfENTRY, eBB0, cBsBullBOS)
-int eSB = f_pickN(tfENTRY, eSB0, cBsBearBOS)
-float hSH = f_pickF(tfHTF, hSH0, cSH)
-float hSL = f_pickF(tfHTF, hSL0, cSL)
-bool chartIsEntry = tfENTRY == timeframe.period
+int hSt = f_pick(f_tfUse(tfHTF), hSt0, cState)
+int hHt = f_pick(f_tfUse(tfHTF), hHt0, cHiType)
+int hLt = f_pick(f_tfUse(tfHTF), hLt0, cLoType)
+int hBB = f_pickN(f_tfUse(tfHTF), hBB0, cBsBullBOS)
+int hSB = f_pickN(f_tfUse(tfHTF), hSB0, cBsBearBOS)
+int mSt = f_pick(f_tfUse(tfMTF), mSt0, cState)
+int mHt = f_pick(f_tfUse(tfMTF), mHt0, cHiType)
+int mLt = f_pick(f_tfUse(tfMTF), mLt0, cLoType)
+int mBB = f_pickN(f_tfUse(tfMTF), mBB0, cBsBullBOS)
+int mSB = f_pickN(f_tfUse(tfMTF), mSB0, cBsBearBOS)
+int lSt = f_pick(f_tfUse(tfLTF), lSt0, cState)
+int lHt = f_pick(f_tfUse(tfLTF), lHt0, cHiType)
+int lLt = f_pick(f_tfUse(tfLTF), lLt0, cLoType)
+int lBB = f_pickN(f_tfUse(tfLTF), lBB0, cBsBullBOS)
+int lSB = f_pickN(f_tfUse(tfLTF), lSB0, cBsBearBOS)
+int eSt = f_pick(f_tfUse(tfENTRY), eSt0, cState)
+int eHt = f_pick(f_tfUse(tfENTRY), eHt0, cHiType)
+int eLt = f_pick(f_tfUse(tfENTRY), eLt0, cLoType)
+int eBB = f_pickN(f_tfUse(tfENTRY), eBB0, cBsBullBOS)
+int eSB = f_pickN(f_tfUse(tfENTRY), eSB0, cBsBearBOS)
+float hSH = f_pickF(f_tfUse(tfHTF), hSH0, cSH)
+float hSL = f_pickF(f_tfUse(tfHTF), hSL0, cSL)
+bool chartIsEntry = f_tfUse(tfENTRY) == timeframe.period
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 11. FILTERS: momentum, volatility, sessions, chop  (secondary – never the trigger)
@@ -671,6 +689,73 @@ bool  midCross = htfRangeOK and not na(htfMid) and ((close > htfMid and close[1]
 int   midCrosses = int(math.sum(midCross ? 1 : 0, chopWindow))
 bool  boxed    = inHtfRange and midCrosses >= rangeCrosses
 bool  trendOK  = not (useRangeBlock and boxed)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 11c. SUPPORT AND RESISTANCE — prices several confirmed swings have turned at
+//      A single swing is one opinion. A price three swings have respected is a level.
+// ──────────────────────────────────────────────────────────────────────────────
+var array<float> srPx  = array.new<float>()
+var array<int>   srCnt = array.new<int>()
+
+f_srAdd(float px, float tol) =>
+    int hit = -1
+    if not na(px)
+        if array.size(srPx) > 0
+            for i = 0 to array.size(srPx) - 1
+                if math.abs(array.get(srPx, i) - px) <= tol
+                    hit := i
+                    break
+        if hit >= 0
+            int c = array.get(srCnt, hit)
+            array.set(srPx, hit, (array.get(srPx, hit) * c + px) / (c + 1))
+            array.set(srCnt, hit, c + 1)
+        else
+            array.push(srPx, px)
+            array.push(srCnt, 1)
+        if array.size(srPx) > srMax
+            array.shift(srPx)
+            array.shift(srCnt)
+    hit
+
+if cHiEvt == 1
+    f_srAdd(cSH, srTolATR * cATR)
+if cLoEvt == 1
+    f_srAdd(cSL, srTolATR * cATR)
+
+// nearest level of the required strength on each side
+float srAbove  = na
+float srBelow  = na
+int   srAboveN = 0
+int   srBelowN = 0
+if array.size(srPx) > 0
+    for i = 0 to array.size(srPx) - 1
+        float p = array.get(srPx, i)
+        int   c = array.get(srCnt, i)
+        if c >= srMinTouch
+            if p > close and (na(srAbove) or p < srAbove)
+                srAbove  := p
+                srAboveN := c
+            if p < close and (na(srBelow) or p > srBelow)
+                srBelow  := p
+                srBelowN := c
+
+// do not buy into resistance, do not sell into support
+bool srOKLong  = not useSR or na(srAbove) or srAbove - close >= srRoomATR * cATR
+bool srOKShort = not useSR or na(srBelow) or close - srBelow >= srRoomATR * cATR
+
+// rejection entry: price wicks into the level and closes back off it
+var int srLongLast  = na
+var int srShortLast = na
+bool srLongRaw  = useSREntry and not na(srBelow) and cState != -1 and close > open and
+     low <= srBelow + srTolATR * cATR and close > srBelow and
+     (na(srLongLast) or bar_index - srLongLast >= srReArm)
+bool srShortRaw = useSREntry and not na(srAbove) and cState != 1 and close < open and
+     high >= srAbove - srTolATR * cATR and close < srAbove and
+     (na(srShortLast) or bar_index - srShortLast >= srReArm)
+if srLongRaw
+    srLongLast := bar_index
+if srShortRaw
+    srShortLast := bar_index
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 12. MULTI-TIMEFRAME BIAS
@@ -924,26 +1009,30 @@ bool adxGateSoft   = not useADXGate or adx >= adxThr * 0.6
 [scST, bdST] = f_score(-1, 2, false, false)
 [scLP, bdLP] = f_score(1,  3, false, false)
 [scSP, bdSP] = f_score(-1, 3, false, false)
+[scLR2, bdLR2] = f_score(1,  3, false, false)
+[scSR2, bdSR2] = f_score(-1, 3, false, false)
 [scLF, bdLF] = f_score(1,  2, false, false)
 [scSF, bdSF] = f_score(-1, 2, false, false)
 [scLS, bdLS] = f_score(1,  cRevBull ? 1 : 0, cREvDow, cREvSwp or extEvLong)
 [scSS, bdSS] = f_score(-1, cRevBear ? 1 : 0, cREvDow, cREvSwp or extEvShort)
 
-bool longCont  = gateCommon and candLongCont  and htfOKLong  and brkLong  <= maxBreakATR and scLC >= minScore and liqRoomLong  and spaceLong  and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK
-bool longRev   = gateCommon and candLongRev   and revOKLong  and brkLong  <= maxBreakATR and scLR >= minScore and liqRoomLong  and spaceLong  and extOKLong and targetOKLong and zoneOKLong and adxGateSoft
-bool shortCont = gateCommon and candShortCont and htfOKShort and brkShort <= maxBreakATR and scSC >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK
-bool shortRev  = gateCommon and candShortRev  and revOKShort and brkShort <= maxBreakATR and scSR >= minScore and liqRoomShort and spaceShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft
+bool longCont  = gateCommon and candLongCont  and htfOKLong  and brkLong  <= maxBreakATR and scLC >= minScore and srOKLong and liqRoomLong  and spaceLong  and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK
+bool longRev   = gateCommon and candLongRev   and revOKLong  and brkLong  <= maxBreakATR and scLR >= minScore and srOKLong and liqRoomLong  and spaceLong  and extOKLong and targetOKLong and zoneOKLong and adxGateSoft
+bool shortCont = gateCommon and candShortCont and htfOKShort and brkShort <= maxBreakATR and scSC >= minScore and srOKShort and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK
+bool shortRev  = gateCommon and candShortRev  and revOKShort and brkShort <= maxBreakATR and scSR >= minScore and srOKShort and liqRoomShort and spaceShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft
 // second-chance entries – their own shorter cooldown so a retest is not swallowed by the breakout signal
-bool longRetest  = gateFast and enableLong  and enableRetest   and retestLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLT >= minScore and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev)
-bool shortRetest = gateFast and enableShort and enableRetest   and retestShortRaw and htfOKShort and extShort <= maxExtATR and scST >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev)
-bool longPB      = gateFast and enableLong  and enablePullback and pbLongRaw  and hSt == 1  and mSt != -1 and extLong  <= maxExtATR and scLP >= minScore and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev or longRetest)
-bool shortPB     = gateFast and enableShort and enablePullback and pbShortRaw and hSt == -1 and mSt != 1  and extShort <= maxExtATR and scSP >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev or shortRetest)
+bool longRetest  = gateFast and enableLong  and enableRetest   and retestLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLT >= minScore and srOKLong and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev)
+bool shortRetest = gateFast and enableShort and enableRetest   and retestShortRaw and htfOKShort and extShort <= maxExtATR and scST >= minScore and srOKShort and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev)
+bool longPB      = gateFast and enableLong  and enablePullback and pbLongRaw  and hSt == 1  and mSt != -1 and extLong  <= maxExtATR and scLP >= minScore and srOKLong and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev or longRetest)
+bool shortPB     = gateFast and enableShort and enablePullback and pbShortRaw and hSt == -1 and mSt != 1  and extShort <= maxExtATR and scSP >= minScore and srOKShort and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev or shortRetest)
 // counter-trend scalps into internal liquidity – lower bar, because HTF alignment can never pay here
-bool longScalp  = gateFast and enableLong  and enableScalp and scalpLongRaw  and scalpRoomUp and brkLong  <= maxBreakATR and scLS >= scalpScore and scalpZoneUp and spaceLong and extOKLong and targetOKLong and zoneOKLong and adxGateSoft and not (longCont or longRev or longRetest or longPB)
-bool shortScalp = gateFast and enableShort and enableScalp and scalpShortRaw and scalpRoomDn and brkShort <= maxBreakATR and scSS >= scalpScore and scalpZoneDn and spaceShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft and not (shortCont or shortRev or shortRetest or shortPB)
-bool longFVG   = gateFast and enableLong  and fvgLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLF >= minScore and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev or longRetest or longPB)
-bool shortFVG  = gateFast and enableShort and fvgShortRaw and htfOKShort and extShort <= maxExtATR and scSF >= minScore and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev or shortRetest or shortPB)
-bool anySig    = longCont or longRev or shortCont or shortRev or longRetest or shortRetest or longPB or shortPB or longScalp or shortScalp or longFVG or shortFVG
+bool longScalp  = gateFast and enableLong  and enableScalp and scalpLongRaw  and scalpRoomUp and brkLong  <= maxBreakATR and scLS >= scalpScore and srOKLong and scalpZoneUp and spaceLong and extOKLong and targetOKLong and zoneOKLong and adxGateSoft and not (longCont or longRev or longRetest or longPB)
+bool shortScalp = gateFast and enableShort and enableScalp and scalpShortRaw and scalpRoomDn and brkShort <= maxBreakATR and scSS >= scalpScore and srOKShort and scalpZoneDn and spaceShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft and not (shortCont or shortRev or shortRetest or shortPB)
+bool longFVG   = gateFast and enableLong  and fvgLongRaw  and htfOKLong  and extLong  <= maxExtATR and scLF >= minScore and srOKLong and liqRoomLong and spaceLong and trendOK and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateOK and not (longCont or longRev or longRetest or longPB)
+bool shortFVG  = gateFast and enableShort and fvgShortRaw and htfOKShort and extShort <= maxExtATR and scSF >= minScore and srOKShort and liqRoomShort and spaceShort and trendOK and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateOK and not (shortCont or shortRev or shortRetest or shortPB)
+bool longSR    = gateFast and enableLong  and srLongRaw  and extLong  <= maxExtATR and scLR2 >= minScore and liqRoomLong and spaceLong and entryOKLong and extOKLong and targetOKLong and zoneOKLong and adxGateSoft and srOKLong and not (longCont or longRev or longRetest or longPB or longScalp or longFVG)
+bool shortSR   = gateFast and enableShort and srShortRaw and extShort <= maxExtATR and scSR2 >= minScore and liqRoomShort and spaceShort and entryOKShort and extOKShort and targetOKShort and zoneOKShort and adxGateSoft and srOKShort and not (shortCont or shortRev or shortRetest or shortPB or shortScalp or shortFVG)
+bool anySig    = longCont or longRev or shortCont or shortRev or longRetest or shortRetest or longPB or shortPB or longScalp or shortScalp or longFVG or shortFVG or longSR or shortSR
 
 // ── gate audit: which rule refuses the most valid setups ──────────────────
 var int auCand   = 0
@@ -960,8 +1049,9 @@ var int auSpace  = 0
 var int auRange  = 0
 var int auCool   = 0
 var int auChop   = 0
-bool candL = candLongCont  or candLongRev  or retestLongRaw  or pbLongRaw  or scalpLongRaw  or fvgLongRaw
-bool candS = candShortCont or candShortRev or retestShortRaw or pbShortRaw or scalpShortRaw or fvgShortRaw
+var int auSR     = 0
+bool candL = candLongCont  or candLongRev  or retestLongRaw  or pbLongRaw  or scalpLongRaw  or fvgLongRaw  or srLongRaw
+bool candS = candShortCont or candShortRev or retestShortRaw or pbShortRaw or scalpShortRaw or fvgShortRaw or srShortRaw
 if (candL or candS) and barstate.isconfirmed
     auCand += 1
     if anySig
@@ -987,6 +1077,8 @@ if (candL or candS) and barstate.isconfirmed
             auTarget += 1
         if (candL and not liqRoomLong) or (candS and not liqRoomShort)
             auRoom += 1
+        if (candL and not srOKLong) or (candS and not srOKShort)
+            auSR += 1
         if (candL and not spaceLong) or (candS and not spaceShort)
             auSpace += 1
         float bestL = math.max(math.max(scLC, scLR), math.max(scLT, scLP))
@@ -999,9 +1091,9 @@ bool weakLong  = gateCommon and ((candLongCont and htfOKLong) or (candLongRev an
 bool weakShort = gateCommon and ((candShortCont and htfOKShort) or (candShortRev and revOKShort)) and brkShort <= maxBreakATR and not (shortCont or shortRev or shortRetest or shortPB)
 int  weakScore = weakLong ? (candLongRev ? scLR : scLC) : weakShort ? (candShortRev ? scSR : scSC) : 0
 
-int    sigScore = longCont ? scLC : longRev ? scLR : shortCont ? scSC : shortRev ? scSR : longRetest ? scLT : shortRetest ? scST : longPB ? scLP : shortPB ? scSP : longScalp ? scLS : shortScalp ? scSS : longFVG ? scLF : shortFVG ? scSF : 0
-string sigBreak = longCont ? bdLC : longRev ? bdLR : shortCont ? bdSC : shortRev ? bdSR : longRetest ? bdLT : shortRetest ? bdST : longPB ? bdLP : shortPB ? bdSP : longScalp ? bdLS : shortScalp ? bdSS : longFVG ? bdLF : shortFVG ? bdSF : ""
-string sigType  = longCont ? "LONG" : longRev ? "LONG REVERSAL" : shortCont ? "SHORT" : shortRev ? "SHORT REVERSAL" : longRetest ? "LONG RETEST" : shortRetest ? "SHORT RETEST" : longPB ? "LONG PULLBACK" : shortPB ? "SHORT PULLBACK" : longScalp ? "LONG SCALP" : shortScalp ? "SHORT SCALP" : longFVG ? "LONG FVG" : shortFVG ? "SHORT FVG" : ""
+int    sigScore = longCont ? scLC : longRev ? scLR : shortCont ? scSC : shortRev ? scSR : longRetest ? scLT : shortRetest ? scST : longPB ? scLP : shortPB ? scSP : longScalp ? scLS : shortScalp ? scSS : longFVG ? scLF : shortFVG ? scSF : longSR ? scLR2 : shortSR ? scSR2 : 0
+string sigBreak = longCont ? bdLC : longRev ? bdLR : shortCont ? bdSC : shortRev ? bdSR : longRetest ? bdLT : shortRetest ? bdST : longPB ? bdLP : shortPB ? bdSP : longScalp ? bdLS : shortScalp ? bdSS : longFVG ? bdLF : shortFVG ? bdSF : longSR ? bdLR2 : shortSR ? bdSR2 : ""
+string sigType  = longCont ? "LONG" : longRev ? "LONG REVERSAL" : shortCont ? "SHORT" : shortRev ? "SHORT REVERSAL" : longRetest ? "LONG RETEST" : shortRetest ? "SHORT RETEST" : longPB ? "LONG PULLBACK" : shortPB ? "SHORT PULLBACK" : longScalp ? "LONG SCALP" : shortScalp ? "SHORT SCALP" : longFVG ? "LONG FVG" : shortFVG ? "SHORT FVG" : longSR ? "LONG S/R" : shortSR ? "SHORT S/R" : ""
 
 var string lastSigText  = "—"
 var int    lastSigScore = 0
@@ -1120,7 +1212,7 @@ bool slJustHit = false
 
 // ── new signal: close opposing positions, cull the oldest, record this one ──
 if showSLTP and anySig
-    int   dir = (longCont or longRev or longRetest or longPB or longScalp or longFVG) ? 1 : -1
+    int   dir = (longCont or longRev or longRetest or longPB or longScalp or longFVG or longSR) ? 1 : -1
     float e   = close
     float s   = f_slPrice(dir, e, cATR)
     [tq1, tq2, tq3, rk] = f_tpPrices(dir, e, s)
@@ -1273,6 +1365,11 @@ f_swingInfo(int t, bool isHigh) =>
     bool   vis = typeOn or showSwingPts
     [typeOn ? txt : "•", col, vis]
 
+// marker lanes: 0 is the price itself, where swing labels live
+f_lane(bool up, float mult) =>
+    float off = labelGapATR * mult * cATR
+    up ? low - off : high + off
+
 f_setLvl(line ln, label lb, float px, int x1, string txt, color col, int fade) =>
     if na(px)
         line.set_color(ln, color.new(col, 100))
@@ -1358,52 +1455,57 @@ if showBOS and cBearBOS
 // ── sweeps / failed breaks (context decides the wording) ──
 if showSweepLbl and cSweepHigh and not watchBear
     bool bullCtx = cPrevState == 1 or cPrevState == -2
-    label.new(bar_index, high, bullCtx ? "FAILED BULL BREAK" : "BEARISH SWEEP", style = label.style_label_down, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
+    label.new(bar_index, f_lane(false, 2), bullCtx ? "FAILED BULL BREAK" : "BEARISH SWEEP", style = label.style_label_down, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
 if showSweepLbl and cSweepLow and not watchBull
     bool bearCtx = cPrevState == -1 or cPrevState == 2
-    label.new(bar_index, low, bearCtx ? "BULLISH SWEEP" : "FAILED BEAR BREAK", style = label.style_label_up, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
+    label.new(bar_index, f_lane(true, 2), bearCtx ? "BULLISH SWEEP" : "FAILED BEAR BREAK", style = label.style_label_up, color = color.new(cWatch, 80), textcolor = cWatch, size = size.tiny)
 
 // ── external liquidity taken ──
 if showLiq and showERL and extLoEvt
-    label.new(bar_index, low, "ERL SWEPT ▼", style = label.style_label_up, color = color.new(cBull, 60), textcolor = color.white, size = size.tiny,
+    label.new(bar_index, f_lane(true, 4), "ERL SWEPT ▼", style = label.style_label_up, color = color.new(cBull, 60), textcolor = color.white, size = size.tiny,
          tooltip = "The higher-timeframe swing low has been reached. Sell-side liquidity there is now filled, so shorts are held for " + str.tostring(extSweepBars) + " bars and this counts as bullish reversal evidence.")
 if showLiq and showERL and extHiEvt
-    label.new(bar_index, high, "ERL SWEPT ▲", style = label.style_label_down, color = color.new(cBear, 60), textcolor = color.white, size = size.tiny,
+    label.new(bar_index, f_lane(false, 4), "ERL SWEPT ▲", style = label.style_label_down, color = color.new(cBear, 60), textcolor = color.white, size = size.tiny,
          tooltip = "The higher-timeframe swing high has been reached. Buy-side liquidity there is now filled, so longs are held for " + str.tostring(extSweepBars) + " bars and this counts as bearish reversal evidence.")
 
 // ── stage-1 reversal watch markers ──
 if showWatch and watchBull
-    label.new(bar_index, low, "REV WATCH ▲" + (cSweepLow ? " · SWEEP" : cLoEvt > 0 ? " · HL" : ""), style = label.style_label_up, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bearish structure showing bullish reversal evidence (HL and/or sweep). No trade yet – wait for the break of the last LH.")
+    label.new(bar_index, f_lane(true, 3), "REV WATCH ▲" + (cSweepLow ? " · SWEEP" : cLoEvt > 0 ? " · HL" : ""), style = label.style_label_up, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bearish structure showing bullish reversal evidence (HL and/or sweep). No trade yet – wait for the break of the last LH.")
 if showWatch and watchBear
-    label.new(bar_index, high, "REV WATCH ▼" + (cSweepHigh ? " · SWEEP" : cHiEvt > 0 ? " · LH" : ""), style = label.style_label_down, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bullish structure showing bearish reversal evidence (LH and/or sweep). No trade yet – wait for the break of the last HL.")
+    label.new(bar_index, f_lane(false, 3), "REV WATCH ▼" + (cSweepHigh ? " · SWEEP" : cHiEvt > 0 ? " · LH" : ""), style = label.style_label_down, color = color.new(cWatch, 70), textcolor = color.white, size = size.tiny, tooltip = "Bullish structure showing bearish reversal evidence (LH and/or sweep). No trade yet – wait for the break of the last HL.")
 
 // ── signals (created once, never moved) ──
 if showSignals and (longCont or shortCont)
     string tCont = (longCont ? "▲ LONG" : "▼ SHORT") + (showScore ? "\n" + str.tostring(sigScore) : "")
-    label.new(bar_index, longCont ? low : high, tCont, style = longCont ? label.style_label_up : label.style_label_down,
+    label.new(bar_index, f_lane(longCont, 1), tCont, style = longCont ? label.style_label_up : label.style_label_down,
          color = longCont ? cBull : cBear, textcolor = color.white, size = size.normal, tooltip = f_strength(sigScore) + " (" + str.tostring(sigScore) + ")\n" + sigBreak + sltpTip)
 if showRevLbl and (longRev or shortRev)
     string tRev = (longRev ? "↗ LONG REVERSAL" : "↘ SHORT REVERSAL") + (showScore ? "\n" + str.tostring(sigScore) : "")
-    label.new(bar_index, longRev ? low : high, tRev, style = longRev ? label.style_label_up : label.style_label_down,
+    label.new(bar_index, f_lane(longRev, 1), tRev, style = longRev ? label.style_label_up : label.style_label_down,
          color = longRev ? cBull : cBear, textcolor = color.white, size = size.normal, tooltip = f_strength(sigScore) + " (" + str.tostring(sigScore) + ")\n" + sigBreak + sltpTip)
 if showSignals and (longRetest or shortRetest or longPB or shortPB)
     bool isL = longRetest or longPB
     string tPb = (longRetest ? "⤴ LONG RETEST" : longPB ? "▲ LONG PULLBACK" : shortRetest ? "⤵ SHORT RETEST" : "▼ SHORT PULLBACK") + (showScore ? "\n" + str.tostring(sigScore) : "")
-    label.new(bar_index, isL ? low : high, tPb, style = isL ? label.style_label_up : label.style_label_down,
+    label.new(bar_index, f_lane(isL, 1), tPb, style = isL ? label.style_label_up : label.style_label_down,
          color = isL ? cBull : cBear, textcolor = color.white, size = size.small,
          tooltip = f_strength(sigScore) + " (" + str.tostring(sigScore) + ")\n" + sigBreak + sltpTip)
+if showSignals and (longSR or shortSR)
+    string tSr = (longSR ? "LONG S/R" : "SHORT S/R") + (showScore ? "  " + str.tostring(sigScore) : "")
+    label.new(bar_index, f_lane(longSR, 1), tSr, style = longSR ? label.style_label_up : label.style_label_down,
+         color = longSR ? cBull : cBear, textcolor = color.white, size = size.small,
+         tooltip = "Rejection from a level with " + str.tostring(longSR ? srBelowN : srAboveN) + " confirmed touches.\n" + sigBreak + sltpTip)
 if showSignals and (longFVG or shortFVG)
     string tFv = (longFVG ? "LONG FVG" : "SHORT FVG") + (showScore ? "  " + str.tostring(sigScore) : "")
-    label.new(bar_index, longFVG ? low : high, tFv, style = longFVG ? label.style_label_up : label.style_label_down,
+    label.new(bar_index, f_lane(longFVG, 1), tFv, style = longFVG ? label.style_label_up : label.style_label_down,
          color = longFVG ? cBull : cBear, textcolor = color.white, size = size.small,
          tooltip = "Entry on the retracement into the gap left by the displacement leg.\n" + sigBreak + sltpTip)
 if showSignals and (longScalp or shortScalp)
     string tSc = (longScalp ? "↑ LONG SCALP" : "↓ SHORT SCALP") + (showScore ? "  " + str.tostring(sigScore) : "")
-    label.new(bar_index, longScalp ? low : high, tSc, style = longScalp ? label.style_label_up : label.style_label_down,
+    label.new(bar_index, f_lane(longScalp, 1), tSc, style = longScalp ? label.style_label_up : label.style_label_down,
          color = color.new(longScalp ? cBull : cBear, 45), textcolor = color.white, size = size.small,
          tooltip = "Counter-trend scalp inside the higher-timeframe range.\nHTF stays " + f_stateText(hSt) + ", this targets internal liquidity only.\n" + sigBreak + sltpTip)
 if showWeak and (weakLong or weakShort)
-    label.new(bar_index, weakLong ? low : high, str.tostring(weakScore), style = weakLong ? label.style_label_up : label.style_label_down,
+    label.new(bar_index, f_lane(weakLong, 1), str.tostring(weakScore), style = weakLong ? label.style_label_up : label.style_label_down,
          color = color.new(cNeut, 70), textcolor = color.white, size = size.tiny, tooltip = "Setup below the minimum score")
 
 // ── developing (unconfirmed) swing candidate: one reusable marker ──
@@ -1437,6 +1539,10 @@ var line  loPrevLvl = na
 var label hiLvlLbl  = na
 var label loLvlLbl  = na
 var label devLbl    = na
+var line  srLnUp    = na
+var line  srLnDn    = na
+var label srLbUp    = na
+var label srLbDn    = na
 var box   fvgBoxU   = na
 var box   fvgBoxD   = na
 var line  erlHiLn   = na
@@ -1493,11 +1599,20 @@ if barstate.islast
             erlLoLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
             irlHiLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
             irlLoLb := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
-        int lx = bar_index - math.min(bar_index, 300)
-        f_setLvl(erlHiLn, erlHiLb, showERL ? hSH : na, lx, "ERL HIGH · " + f_tfLabel(tfHTF), cBear, 25)
-        f_setLvl(erlLoLn, erlLoLb, showERL ? hSL : na, lx, "ERL LOW · " + f_tfLabel(tfHTF), cBull, 25)
+        int lx = bar_index - math.min(bar_index, 150)
+        f_setLvl(erlHiLn, erlHiLb, showERL ? hSH : na, lx, "ERL HIGH · " + f_tfLabel(f_tfUse(tfHTF)), cBear, 25)
+        f_setLvl(erlLoLn, erlLoLb, showERL ? hSL : na, lx, "ERL LOW · " + f_tfLabel(f_tfUse(tfHTF)), cBull, 25)
         f_setLvl(irlHiLn, irlHiLb, showIRL ? irlUp : na, lx, "IRL ↑", cWatch, 40)
         f_setLvl(irlLoLn, irlLoLb, showIRL ? irlDn : na, lx, "IRL ↓", cWatch, 40)
+    if showSR
+        if na(srLnUp)
+            srLnUp  := line.new(bar_index, close, bar_index, close, width = 2, style = line.style_dashed)
+            srLnDn  := line.new(bar_index, close, bar_index, close, width = 2, style = line.style_dashed)
+            srLbUp  := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+            srLbDn  := label.new(bar_index, close, "", style = label.style_label_left, color = color.new(color.white, 100), size = size.tiny)
+        int sx = bar_index - math.min(bar_index, 150)
+        f_setLvl(srLnUp, srLbUp, srAbove, sx, "RES x" + str.tostring(srAboveN), cBear, 35)
+        f_setLvl(srLnDn, srLbDn, srBelow, sx, "SUP x" + str.tostring(srBelowN), cBull, 35)
     if showFVG
         if na(fvgBoxU)
             fvgBoxU := box.new(bar_index, close, bar_index, close, border_width = 0)
@@ -1561,10 +1676,10 @@ if showDash and barstate.islast
     table.cell(dash, 1, 1, "STRUCTURE", text_color = cNeut, text_size = sz)
     table.cell(dash, 2, 1, "STATUS",    text_color = cNeut, text_size = sz)
     // timeframe rows
-    f_tfRow(2, f_tfLabel(tfHTF),   hSt, hHt, hLt, hBB, hSB, tfHTF == timeframe.period, sz)
-    f_tfRow(3, f_tfLabel(tfMTF),   mSt, mHt, mLt, mBB, mSB, tfMTF == timeframe.period, sz)
-    f_tfRow(4, f_tfLabel(tfLTF),   lSt, lHt, lLt, lBB, lSB, tfLTF == timeframe.period, sz)
-    f_tfRow(5, f_tfLabel(tfENTRY), eSt, eHt, eLt, eBB, eSB, chartIsEntry, sz)
+    f_tfRow(2, f_tfLabel(f_tfUse(tfHTF)),   hSt, hHt, hLt, hBB, hSB, f_tfUse(tfHTF) == timeframe.period, sz)
+    f_tfRow(3, f_tfLabel(f_tfUse(tfMTF)),   mSt, mHt, mLt, mBB, mSB, f_tfUse(tfMTF) == timeframe.period, sz)
+    f_tfRow(4, f_tfLabel(f_tfUse(tfLTF)),   lSt, lHt, lLt, lBB, lSB, f_tfUse(tfLTF) == timeframe.period, sz)
+    f_tfRow(5, f_tfLabel(f_tfUse(tfENTRY)), eSt, eHt, eLt, eBB, eSB, chartIsEntry, sz)
     if useEntryTF and (not entryOKLong or not entryOKShort)
         table.cell(dash, 0, 5, f_tfLabel(tfENTRY) + (chartIsEntry ? " ●" : "") + (not entryOKLong ? " ⛔▲" : " ⛔▼"), text_color = cWatch, text_size = sz, text_halign = text.align_left)
     // bias
@@ -1610,7 +1725,7 @@ if showDash and barstate.islast
     table.cell(dash, 2, 11, liqLvl, text_color = color.new(color.white, 20), text_size = sz)
     // chart note
     string note = chartIsEntry ? "Signals on " + f_tfLabel(timeframe.period) + " · min score " + str.tostring(minScore) :
-         "Chart " + f_tfLabel(timeframe.period) + " ≠ entry " + f_tfLabel(tfENTRY) + " · signals use chart TF"
+         "Chart " + f_tfLabel(timeframe.period) + " ≠ entry " + f_tfLabel(tfENTRY) + " · rows below it read the chart"
     table.cell(dash, 0, 12, note, text_color = chartIsEntry ? cNeut : cWatch, text_size = sz)
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1661,7 +1776,7 @@ if showDiag and barstate.islast and array.size(trades) > 0
             table.cell(diag, 6, row, t.ctx, text_color = color.new(color.white, 30), text_size = size.tiny)
 
 // ── gate audit table ──────────────────────────────────────────────────────
-var table audit = table.new(position.middle_right, 3, 15, bgcolor = color.new(#0f1218, 5), frame_color = color.new(cNeut, 40), frame_width = 1, border_color = color.new(cNeut, 75), border_width = 1)
+var table audit = table.new(position.middle_right, 3, 16, bgcolor = color.new(#0f1218, 5), frame_color = color.new(cNeut, 40), frame_width = 1, border_color = color.new(cNeut, 75), border_width = 1)
 
 f_auditRow(int row, string name, int hits, int total) =>
     float pct = total > 0 ? hits * 100.0 / total : 0.0
@@ -1686,9 +1801,10 @@ if showDiag and barstate.islast
     f_auditRow(10, "range block",    auRange,  auCand)
     f_auditRow(11, "chop",           auChop,   auCand)
     f_auditRow(12, "cooldown",       auCool,   auCand)
-    table.cell(audit, 0, 13, "SETUPS SEEN", text_color = cNeut, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(audit, 1, 13, str.tostring(auCand), text_color = color.new(color.white, 20), text_size = size.tiny)
-    table.cell(audit, 2, 13, str.tostring(auTaken) + " taken", text_color = cBull, text_size = size.tiny)
+    f_auditRow(13, "into S/R level", auSR,     auCand)
+    table.cell(audit, 0, 14, "SETUPS SEEN", text_color = cNeut, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(audit, 1, 14, str.tostring(auCand), text_color = color.new(color.white, 20), text_size = size.tiny)
+    table.cell(audit, 2, 14, str.tostring(auTaken) + " taken", text_color = cBull, text_size = size.tiny)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 17. ALERTS
@@ -1714,6 +1830,8 @@ alertcondition(extLoEvt,    "External Low Swept",  "{{ticker}} HTF swing low tak
 alertcondition(extHiEvt,    "External High Swept", "{{ticker}} HTF swing high taken | {{interval}} | price {{close}}")
 alertcondition(longFVG,     "LONG Fair Value Gap",  "{{ticker}} LONG gap entry | {{interval}} | price {{close}}")
 alertcondition(shortFVG,    "SHORT Fair Value Gap", "{{ticker}} SHORT gap entry | {{interval}} | price {{close}}")
+alertcondition(longSR,      "LONG Support Rejection",    "{{ticker}} LONG off support | {{interval}} | price {{close}}")
+alertcondition(shortSR,     "SHORT Resistance Rejection", "{{ticker}} SHORT off resistance | {{interval}} | price {{close}}")
 
 f_mtfMsg() =>
     f_tfLabel(tfHTF) + " " + f_stateText(hSt) + " | " + f_tfLabel(tfMTF) + " " + f_stateText(mSt) + " | " +
