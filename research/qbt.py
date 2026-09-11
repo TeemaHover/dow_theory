@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 
 def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
-        atr_col=None, features=None, allow_pyramid=False):
+        atr_col=None, features=None, allow_pyramid=False, exit_on_close=False,
+        trail_l=None, trail_s=None):
     """Simulate. `entries` needs columns dir/stop/target (dir 0 means no signal)."""
     o = work["open"].to_numpy(np.float64)
     h = work["high"].to_numpy(np.float64)
@@ -28,7 +29,10 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
     tags = entries["tag"].to_numpy(object) if "tag" in entries else np.array([""] * n, object)
     atr_arr = work[atr_col].to_numpy(np.float64) if atr_col else None
 
-    half = spread / 2.0
+    # spread may be one number or one value per bar (a cost that scales with price)
+    sp_arr = np.asarray(spread, dtype=np.float64) if np.ndim(spread) else None
+    tl = np.asarray(trail_l, dtype=np.float64) if trail_l is not None else None
+    ts_ = np.asarray(trail_s, dtype=np.float64) if trail_s is not None else None
     rows = []
     i = 0
     in_pos = False
@@ -40,6 +44,9 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 i += 1
                 continue
             e_i = i + 1
+            half = (sp_arr[i] if sp_arr is not None else spread) / 2.0
+            if half != half:
+                half = 0.0
             entry = o[e_i] + (half if d > 0 else -half)
             risk = abs(entry - stop0)
             if risk <= 0:
@@ -54,7 +61,18 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 adv = (entry - l[j]) if d > 0 else (h[j] - entry)
                 mfe = max(mfe, fav / risk)
                 mae = max(mae, adv / risk)
-                hit_stop = (l[j] <= stop) if d > 0 else (h[j] >= stop)
+                if exit_on_close:
+                    # Dow-style: only a CLOSE beyond the stop counts, filled next open
+                    if (c[j] <= stop) if d > 0 else (c[j] >= stop):
+                        if j + 1 < n:
+                            exit_i, exit_px = j + 1, o[j + 1]
+                        else:
+                            exit_i, exit_px = j, c[j]
+                        reason = "close_stop"
+                        break
+                    hit_stop = False
+                else:
+                    hit_stop = (l[j] <= stop) if d > 0 else (h[j] >= stop)
                 hit_tgt = (h[j] >= tgt0) if d > 0 else (l[j] <= tgt0)
                 if hit_stop:                       # stop wins ties, deliberately
                     exit_i, exit_px, reason = j, stop, "stop"
@@ -68,6 +86,10 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 if trail_atr is not None and atr_arr is not None and atr_arr[j] == atr_arr[j]:
                     cand = (c[j] - trail_atr * atr_arr[j]) if d > 0 else (c[j] + trail_atr * atr_arr[j])
                     stop = max(stop, cand) if d > 0 else min(stop, cand)
+                if d > 0 and tl is not None and tl[j] == tl[j]:
+                    stop = max(stop, tl[j])
+                if d < 0 and ts_ is not None and ts_[j] == ts_[j]:
+                    stop = min(stop, ts_[j])
             if exit_i < 0:
                 exit_i = min(n - 1, e_i + max_bars - 1)
                 exit_px, reason = c[exit_i], "timeout"
