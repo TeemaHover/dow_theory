@@ -4,7 +4,8 @@
 // Theory that measured positive
 //
 // Measured 2000-2026 on 42 commodity, index and bond markets, with realistic
-// retail costs on every market and entries filled at the next day's open:
+// retail costs on every market and entries filled at the next day's open, using
+// the trailing stop only:
 //
 //     trades          8,566     about 28 a month across the whole basket
 //     win rate        36.9%
@@ -24,13 +25,20 @@
 //     volume confirmation                   rejected: no improvement
 //     gold and silver confirming each other rejected: failed in 2016-26
 //
+// Take-profit, measured on the same data (profit factor 2000-15 / 2016-26):
+//
+//     trailing stop only, no TP             1.313 / 1.177   best
+//     full exit at 6R        (default)      1.265 / 1.147   hit on about 3% of trades
+//     full exit at 4R                       1.233 / 1.120
+//     full exit at 2R                       1.112 / 1.068
+//     half at 1R, trail the rest            1.159 / 1.106   win rate rises to about 46%
+//
+// Every take-profit costs something, because the edge lives in the rare very
+// large winner. 6R is the default because it costs the least; "Off" gives the
+// best measured result.
+//
 // Do not run this on currency pairs. They trended in 2000-15 (PF 1.21) and have
 // not since (PF 0.85 in 2016-26).
-//
-// The win rate is about 37% and that is not a defect. A coin flip reaches a
-// target of X R about 1/(1+X) of the time, so any win rate can be bought by
-// shrinking the target - and it gains nothing, because the payoff shrinks with
-// it. The edge is in the size of the winners.
 //
 // This is a basket system. One chart gives under one trade a month; the trade
 // count and the smoothness both come from running many markets. Expect losing
@@ -44,7 +52,7 @@ indicator("Trend Core [Daily Momentum + Dow]", shorttitle = "TREND-CORE", overla
 // ── inputs ──────────────────────────────────────────────────────────────────
 G_SIG  = "Signal"
 G_DOW  = "Dow Theory"
-G_RISK = "Risk and Exit"
+G_RISK = "Stop Loss, Take Profit and Risk"
 G_VIS  = "Display"
 
 nBreak = input.int(8, "Breakout Lookback (bars)", minval = 3, maxval = 200, group = G_SIG,
@@ -67,17 +75,23 @@ dowThr = input.float(3.0, "Peak/Trough Swing Size (x ATR)", minval = 1.0, maxval
      tooltip = "A peak or trough only counts once the close has reversed this many ATRs from it. 3.0 is the value that was tested.")
 
 atrLen   = input.int(14, "ATR Length", minval = 5, maxval = 50, group = G_RISK)
-stopATR  = input.float(2.0, "Initial Stop (x ATR)", minval = 0.5, maxval = 6.0, step = 0.1, group = G_RISK)
+stopATR  = input.float(2.0, "Stop Loss (x ATR)", minval = 0.5, maxval = 6.0, step = 0.1, group = G_RISK,
+     tooltip = "Starting stop distance from entry. This distance is also 1R, the unit the take-profit is measured in.")
 trailATR = input.float(2.5, "Trailing Stop (x ATR)", minval = 0.5, maxval = 8.0, step = 0.1, group = G_RISK,
-     tooltip = "The exit is a ratchet: it moves in your favour and never back. It fires on the day's low or high touching it, not on the close - waiting for a closing break was tested and did much worse.")
+     tooltip = "The stop is a ratchet: it moves in your favour and never back. It fires on the day's low or high touching it, not on the close - waiting for a closing break was tested and did much worse.")
+tpMode   = input.string("Full exit at TP", "Take Profit", group = G_RISK,
+     options = ["Full exit at TP", "Half at TP, trail the rest", "Off (trail only)"],
+     tooltip = "Measured profit factor 2000-15 / 2016-26: trailing stop only 1.313 / 1.177; full exit at 6R 1.265 / 1.147; at 4R 1.233 / 1.120; at 2R 1.112 / 1.068; half at 1R 1.159 / 1.106 with a 46% win rate. Every take-profit costs some profit, because the edge is in the rare very large winner.")
+tpR      = input.float(6.0, "Take Profit Distance (R)", minval = 0.5, maxval = 20.0, step = 0.5, group = G_RISK,
+     tooltip = "Distance from entry in multiples of the starting risk. 6R costs the least. Closer targets are hit more often and cost more.")
 riskPct  = input.float(0.25, "Risk Per Trade (% of account)", minval = 0.05, maxval = 5.0, step = 0.05, group = G_RISK,
      tooltip = "Used only to display a suggested position size. The worst measured drawdown across the basket was about 76 times the risk per trade - about 19% of the account at 0.25%.")
 acctSize = input.float(10000, "Account Size", minval = 1, group = G_RISK)
 
-showLevels  = input.bool(true, "Show Stop and Entry Lines", group = G_VIS)
+showLevels  = input.bool(true, "Show Stop, Target and Entry Lines", group = G_VIS)
 showChan    = input.bool(true, "Show Breakout Channel", group = G_VIS)
 showPrimary = input.bool(true, "Show Primary Trend Line", group = G_VIS)
-showLabels  = input.bool(true, "Show Entry Labels", group = G_VIS)
+showLabels  = input.bool(true, "Show Entry and Exit Labels", group = G_VIS)
 showPanel   = input.bool(true, "Show Info Panel", group = G_VIS)
 panelPos    = input.string("Top Right", "Panel Position", group = G_VIS,
      options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"])
@@ -136,6 +150,9 @@ f_isUSIndex() =>
     bool etf = tk == "SPY" or tk == "QQQ" or tk == "DIA" or tk == "IWM"
     fut or cfd or etf
 
+f_r(float r) =>
+    (r >= 0 ? "+" : "") + str.tostring(r, "#.0") + "R"
+
 int djiState = request.security(djiSym, "D", f_dowPrev(dowThr), lookahead = barmerge.lookahead_on)
 int djtState = request.security(djtSym, "D", f_dowPrev(dowThr), lookahead = barmerge.lookahead_on)
 
@@ -164,20 +181,50 @@ bool avgShort = not twoAvgOn or avgDn
 bool rawLong  = allowLong  and not na(chHi) and close > chHi and trendUp and primUp and avgLong
 bool rawShort = allowShort and not na(chLo) and close < chLo and trendDn and primDn and avgShort
 
+bool tpOn   = tpMode != "Off (trail only)"
+bool tpFull = tpMode == "Full exit at TP"
+
 // ── position state ──────────────────────────────────────────────────────────
 var int   pos     = 0          // 1 long, -1 short, 0 flat
 var float entryPx = na
 var float stopPx  = na
 var float riskPx  = na
+var float tpPx    = na
+var bool  tpDone  = false      // half already taken, in the half-and-trail mode
 
+// The stop is checked before the target: inside one bar the order is unknown,
+// and the backtest resolved that against the position.
 bool exitLong  = pos ==  1 and low  <= stopPx
 bool exitShort = pos == -1 and high >= stopPx
+bool tpLong    = pos ==  1 and not exitLong  and tpOn and not tpDone and high >= tpPx
+bool tpShort   = pos == -1 and not exitShort and tpOn and not tpDone and low  <= tpPx
+bool tpHit     = tpLong or tpShort
+
+float exitPx  = exitLong or exitShort ? stopPx : na
+float tpHitPx = tpHit ? tpPx : na
+float closedR = na
 
 if exitLong or exitShort
+    float rStop = pos == 1 ? (stopPx - entryPx) / riskPx : (entryPx - stopPx) / riskPx
+    closedR := tpDone ? 0.5 * tpR + 0.5 * rStop : rStop
     pos := 0
     entryPx := na
     stopPx := na
     riskPx := na
+    tpPx := na
+    tpDone := false
+
+if tpHit
+    if tpFull
+        closedR := tpR
+        pos := 0
+        entryPx := na
+        stopPx := na
+        riskPx := na
+        tpPx := na
+        tpDone := false
+    else
+        tpDone := true
 
 bool goLong  = pos == 0 and rawLong
 bool goShort = pos == 0 and rawShort
@@ -187,11 +234,15 @@ if goLong
     entryPx := close
     stopPx := close - stopATR * atr
     riskPx := stopATR * atr
+    tpPx := close + tpR * riskPx
+    tpDone := false
 else if goShort
     pos := -1
     entryPx := close
     stopPx := close + stopATR * atr
     riskPx := stopATR * atr
+    tpPx := close - tpR * riskPx
+    tpDone := false
 
 // ratchet the trailing stop; it never loosens
 if pos == 1 and not na(stopPx)
@@ -199,8 +250,9 @@ if pos == 1 and not na(stopPx)
 else if pos == -1 and not na(stopPx)
     stopPx := math.min(stopPx, close + trailATR * atr)
 
-float openR = pos == 0 or na(riskPx) or riskPx == 0 ? na :
+float rawR  = pos == 0 or na(riskPx) or riskPx == 0 ? na :
      pos == 1 ? (close - entryPx) / riskPx : (entryPx - close) / riskPx
+float openR = na(rawR) ? na : tpDone ? 0.5 * tpR + 0.5 * rawR : rawR
 
 // suggested size, purely informational
 float units = na(riskPx) or riskPx == 0 ? na : (acctSize * riskPct / 100.0) / riskPx
@@ -211,23 +263,32 @@ plot(showChan ? chLo : na, "Breakout Low",  color = color.new(color.maroon, 45),
 plot(useTrend ? ema : na, "Trend EMA", color = color.new(color.gray, 30), linewidth = 2)
 plot(showPrimary and usePrimary ? prim : na, "Primary Trend", color = color.new(color.orange, 20), linewidth = 2)
 
-plot(showLevels and pos != 0 ? stopPx : na, "Stop", color = color.new(color.red, 0),
+plot(showLevels and pos != 0 ? stopPx : na, "Stop Loss", color = color.new(color.red, 0),
      style = plot.style_linebr, linewidth = 2)
+plot(showLevels and pos != 0 and tpOn and not tpDone ? tpPx : na, "Take Profit",
+     color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
 plot(showLevels and pos != 0 ? entryPx : na, "Entry", color = color.new(color.blue, 25),
      style = plot.style_linebr, linewidth = 1)
 
 if showLabels and goLong
-    label.new(bar_index, low, "LONG" + "\n" + "stop " + str.tostring(stopPx, format.mintick),
+    label.new(bar_index, low, "LONG" + "\n" + "SL " + str.tostring(stopPx, format.mintick) +
+         (tpOn ? "\n" + "TP " + str.tostring(tpPx, format.mintick) : ""),
          style = label.style_label_up, color = color.new(color.teal, 15),
          textcolor = color.white, size = size.small)
 if showLabels and goShort
-    label.new(bar_index, high, "SHORT" + "\n" + "stop " + str.tostring(stopPx, format.mintick),
+    label.new(bar_index, high, "SHORT" + "\n" + "SL " + str.tostring(stopPx, format.mintick) +
+         (tpOn ? "\n" + "TP " + str.tostring(tpPx, format.mintick) : ""),
          style = label.style_label_down, color = color.new(color.maroon, 15),
          textcolor = color.white, size = size.small)
+if showLabels and tpHit
+    label.new(bar_index, tpLong ? high : low, (tpFull ? "TP " : "HALF TP ") + f_r(tpR),
+         style = tpLong ? label.style_label_down : label.style_label_up,
+         color = color.new(color.green, 10), textcolor = color.white, size = size.small)
 if showLabels and (exitLong or exitShort)
-    label.new(bar_index, exitLong ? low : high, "EXIT",
+    label.new(bar_index, exitLong ? low : high, "EXIT " + f_r(closedR),
          style = exitLong ? label.style_label_up : label.style_label_down,
-         color = color.new(color.gray, 25), textcolor = color.white, size = size.tiny)
+         color = closedR >= 0 ? color.new(color.teal, 25) : color.new(color.gray, 25),
+         textcolor = color.white, size = size.tiny)
 
 // ── panel ───────────────────────────────────────────────────────────────────
 f_panelPos() =>
@@ -236,7 +297,7 @@ f_panelPos() =>
      panelPos == "Bottom Left" ? position.bottom_left :
      panelPos == "Middle Right" ? position.middle_right : position.top_right
 
-var table panel = table.new(f_panelPos(), 2, 9, border_width = 1, frame_width = 1)
+var table panel = table.new(f_panelPos(), 2, 10, border_width = 1, frame_width = 1)
 
 f_row(int r, string k, string v, color col) =>
     table.cell(panel, 0, r, k, text_color = color.white, text_size = size.small,
@@ -251,28 +312,35 @@ if showPanel and barstate.islast
     f_row(1, "Position", pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "flat",
          pos == 1 ? color.lime : pos == -1 ? color.red : color.gray)
     f_row(2, "Entry", pos == 0 ? "-" : str.tostring(entryPx, format.mintick), color.white)
-    f_row(3, "Stop", pos == 0 ? "-" : str.tostring(stopPx, format.mintick), color.red)
-    f_row(4, "Open R", na(openR) ? "-" : str.tostring(openR, "#.00") + "R",
+    f_row(3, "Stop Loss (SL)", pos == 0 ? "-" : str.tostring(stopPx, format.mintick), color.red)
+    f_row(4, "Take Profit (TP)", pos == 0 or not tpOn ? "-" : tpDone ? "half taken" :
+         str.tostring(tpPx, format.mintick), color.lime)
+    f_row(5, "Open R", na(openR) ? "-" : str.tostring(openR, "#.00") + "R",
          na(openR) ? color.gray : openR >= 0 ? color.lime : color.red)
-    f_row(5, "Trend (EMA)", close > ema ? "up" : "down", close > ema ? color.lime : color.red)
-    f_row(6, "Primary trend", not usePrimary ? "off" : na(prim) ? "needs " + str.tostring(nPrimary) + " bars" :
+    f_row(6, "Trend (EMA)", close > ema ? "up" : "down", close > ema ? color.lime : color.red)
+    f_row(7, "Primary trend", not usePrimary ? "off" : na(prim) ? "needs " + str.tostring(nPrimary) + " bars" :
          close > prim ? "up" : "down",
          not usePrimary or na(prim) ? color.gray : close > prim ? color.lime : color.red)
-    f_row(7, "Industrials + Transports", not twoAvgOn ? "off" : avgUp ? "both up" :
+    f_row(8, "Industrials + Transports", not twoAvgOn ? "off" : avgUp ? "both up" :
          avgDn ? "both down" : "not agreeing",
          not twoAvgOn ? color.gray : avgUp ? color.lime : avgDn ? color.red : color.orange)
-    f_row(8, "Size at " + str.tostring(riskPct, "#.##") + "%",
+    f_row(9, "Size at " + str.tostring(riskPct, "#.##") + "%",
          na(units) ? "-" : str.tostring(units, "#.###"), color.aqua)
 
 // ── alerts ──────────────────────────────────────────────────────────────────
 alertcondition(goLong,  "Long Entry",  "TREND CORE long {{ticker}} | close {{close}}")
 alertcondition(goShort, "Short Entry", "TREND CORE short {{ticker}} | close {{close}}")
-alertcondition(exitLong or exitShort, "Exit", "TREND CORE exit {{ticker}} | close {{close}}")
+alertcondition(tpHit, "Take Profit", "TREND CORE take profit {{ticker}} | close {{close}}")
+alertcondition(exitLong or exitShort, "Stop Exit", "TREND CORE stop exit {{ticker}} | close {{close}}")
 
 if goLong or goShort
     alert(syminfo.ticker + (goLong ? " LONG " : " SHORT ") + str.tostring(close, format.mintick) +
-     " | stop " + str.tostring(stopPx, format.mintick) +
+     " | SL " + str.tostring(stopPx, format.mintick) +
+     (tpOn ? " | TP " + str.tostring(tpPx, format.mintick) : "") +
      " | risk " + str.tostring(riskPx, format.mintick), alert.freq_once_per_bar_close)
+if tpHit
+    alert(syminfo.ticker + (tpFull ? " TAKE PROFIT, position closed at " : " HALF TAKE PROFIT at ") +
+     str.tostring(tpHitPx, format.mintick) + " | " + f_r(tpR), alert.freq_once_per_bar_close)
 if exitLong or exitShort
-    alert(syminfo.ticker + " EXIT at stop " + str.tostring(stopPx, format.mintick),
-     alert.freq_once_per_bar_close)
+    alert(syminfo.ticker + " STOP EXIT at " + str.tostring(exitPx, format.mintick) + " | " +
+     f_r(closedR), alert.freq_once_per_bar_close)

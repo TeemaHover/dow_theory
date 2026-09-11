@@ -14,7 +14,8 @@ import pandas as pd
 
 def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
         atr_col=None, features=None, allow_pyramid=False, exit_on_close=False,
-        trail_l=None, trail_s=None):
+        trail_l=None, trail_s=None, tp_full_r=None, tp1_r=None, tp1_frac=0.5,
+        be_after_tp1=False):
     """Simulate. `entries` needs columns dir/stop/target (dir 0 means no signal)."""
     o = work["open"].to_numpy(np.float64)
     h = work["high"].to_numpy(np.float64)
@@ -53,6 +54,12 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 i += 1
                 continue
             stop = stop0
+            # take-profit measured from the real fill, in multiples of the real risk
+            if tp_full_r is not None:
+                tgt0 = entry + d * tp_full_r * risk
+            tp1_px = entry + d * tp1_r * risk if tp1_r is not None else np.nan
+            tp1_done = False
+            banked = 0.0
             mfe = mae = 0.0
             exit_i, exit_px, reason = -1, np.nan, ""
             moved_be = False
@@ -77,6 +84,14 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 if hit_stop:                       # stop wins ties, deliberately
                     exit_i, exit_px, reason = j, stop, "stop"
                     break
+                # partial take-profit: bank a fraction at TP1, let the rest keep trailing
+                if tp1_r is not None and not tp1_done:
+                    if (h[j] >= tp1_px) if d > 0 else (l[j] <= tp1_px):
+                        tp1_done = True
+                        px = tp1_px - half if d > 0 else tp1_px + half
+                        banked = tp1_frac * ((px - entry) / risk) * d
+                        if be_after_tp1:
+                            stop = max(stop, entry) if d > 0 else min(stop, entry)
                 if hit_tgt:
                     exit_i, exit_px, reason = j, tgt0, "target"
                     break
@@ -94,11 +109,12 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 exit_i = min(n - 1, e_i + max_bars - 1)
                 exit_px, reason = c[exit_i], "timeout"
             exit_px = exit_px - half if d > 0 else exit_px + half
-            r = ((exit_px - entry) / risk) * d
+            r_rest = ((exit_px - entry) / risk) * d
+            r = banked + (1.0 - tp1_frac) * r_rest if tp1_done else r_rest
             rec = {"entry_time": idx[e_i], "exit_time": idx[exit_i], "dir": d,
                    "entry": entry, "stop": stop0, "target": tgt0, "exit": exit_px,
                    "r": r, "mfe": mfe, "mae": mae, "bars": exit_i - e_i,
-                   "reason": reason, "tag": tags[i]}
+                   "reason": reason, "tag": tags[i], "tp1": tp1_done}
             if features is not None:
                 for k in features.columns:
                     rec["f_" + k] = features[k].iloc[i]

@@ -121,7 +121,7 @@ def tc(df, atr, nb=8, nt=100, satr=2.0, fl=None, fs=None):
 
 
 def run(syms, build, max_bars=250, trail=2.5, exit_on_close=False, trail_fn=None,
-        cost_mult=1.0):
+        cost_mult=1.0, **engine):
     frames = []
     for s in syms:
         try:
@@ -139,7 +139,7 @@ def run(syms, build, max_bars=250, trail=2.5, exit_on_close=False, trail_fn=None
             tl, ts_ = trail_fn(s, df, atr)
         tr = qbt.run(w, ent, spread=spread, max_bars=max_bars, trail_atr=trail,
                      atr_col="atr" if trail else None, exit_on_close=exit_on_close,
-                     trail_l=tl, trail_s=ts_)
+                     trail_l=tl, trail_s=ts_, **engine)
         if len(tr):
             tr["sym"] = s
             frames.append(tr)

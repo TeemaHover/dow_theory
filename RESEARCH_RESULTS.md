@@ -22,6 +22,10 @@ every market and every entry filled at the next day's open:
 
 20 of 27 years positive. +1,058R in total, and still +769R with the two best years
 removed. 33 of 42 markets positive. Worst drawdown across the basket about 76R.
+
+These figures are for the trailing stop alone. The indicator's default adds a
+take-profit at 6R, which measured PF 1.265 and 1.147 in the two eras (Part 5); set
+Take Profit to "Off (trail only)" to run exactly the system above.
 Gold on its own: 228 trades, 40.8% winners, profit factor 1.856, worst drawdown 9.2R.
 
 ## How the engine keeps itself honest
@@ -167,6 +171,30 @@ Adopted: better in both eras on both measures, and above 20 trades a month in bo
   zero mismatches over about 26,000 daily bars on four markets. It compiles on
   TradingView, and `DJ:DJI` and `DJ:DJT` both resolve there.
 
+## Part 5 — adding a take-profit
+
+Same 42 markets and Dow version. Selection rule fixed before running: among the
+take-profit styles, keep the one with the best 2000–15 expectancy.
+
+| exit style | PF 2000–15 | PF 2016–26 | win rate | TP reached |
+|---|---|---|---|---|
+| **trailing stop only** | **1.313** | **1.177** | 37% | — |
+| full exit at 6R (selected) | 1.265 | 1.147 | 37% | ~3% |
+| full exit at 4R | 1.233 | 1.120 | 37% | ~8% |
+| full exit at 3R | 1.174 | 1.082 | 37% | ~13% |
+| full exit at 2R | 1.112 | 1.068 | 37% | ~24% |
+| half at 3R, trail the rest | 1.255 | 1.131 | 37% | ~13% |
+| half at 2R, trail the rest | 1.207 | 1.119 | 37% | ~24% |
+| half at 1R, trail the rest | 1.159 | 1.106 | **46%** | ~46% |
+| half at 1R, then stop to entry | 1.161 | 1.096 | 47% | ~46% |
+
+Every take-profit costs profit factor in both eras, and the closer the target the
+more it costs, because the edge lives in the rare very large winner. The indicator
+now draws a stop-loss and a take-profit on every trade, defaulting to a full exit
+at 6R, the least costly option; "Off (trail only)" restores the best measured result,
+and "half at 1R" is there for anyone who prefers a 46% win rate at a lower profit
+factor. Moving the stop to entry after the first half made no difference.
+
 ## What to expect if you trade it
 
 - About 28 trades a month **across all 42 markets** — under one a month on any single
@@ -183,5 +211,6 @@ Adopted: better in both eras on both measures, and above 20 trades a month in bo
 - `TrendCore_Daily.pine` — the system above, for TradingView.
 - `research/qdownload.py` — downloads every market used here into `data/`.
 - `research/qdow.py`, `qdow2.py`, `qdow3.py` — the Dow tests in Part 4, in order.
+- `research/qtp.py` — the take-profit test in Part 5.
 - `research/` — data layer, structure detection, backtest engine, diagnostics.
 - `data/` and the run outputs are not committed; the scripts regenerate them.
