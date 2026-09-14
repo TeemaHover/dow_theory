@@ -353,10 +353,52 @@ failure and re-entering lost everywhere (basket PF 0.90–0.96).
 
 The indicator now detects failures in every mode — an orange marker at the level while it
 watches, "FAILED - pullback?" when a breakout fails, then "RESUMED" or "REVERSAL", plus a
-"Failed Breakout" alert — and can trade the re-entry with Entry Type "Breakout +
+"Failed Breakout" alert (the labels were renamed to show direction, see the end of Part
+10) — and can trade the re-entry with Entry Type "Breakout +
 Pullback". The Pine version matched an independent replay with 0 mismatches in 32,100
 values in each of Breakout, Breakout + Pullback, Retest and Breakout + Retest, and is
 identical to the previous version in Breakout mode. Script: `research/qpull.py`.
+
+## Part 10 — checking the REVERSAL label with hindsight (correction)
+
+A chart on 11 September 2026 showed REVERSAL at 16:45 UTC, where a short breakout's
+failure closed 4,361.61 — 0.46 ATR above the 100 EMA — after which price fell to 4,345:
+a pullback, not a reversal. Part 9 had measured the rule's statistics and verified the
+code, but never checked whether each label was right afterwards. Checked now: a REVERSAL
+is wrong if within 20 bars price closes back beyond the level in the original direction;
+a RESUMED is wrong if price closes more than 2 ATR on the other side.
+
+On 15-minute gold, REVERSAL labels caused by a close crossing the EMA100 or SMA250 were
+wrong 54% of the time; those caused by a close more than 2 ATR beyond the level were
+wrong 30%. Rules compared, fixed before running:
+
+| REVERSAL wrong / RESUMED wrong | spot gold daily | gold 15-minute | cash indices | futures basket |
+|---|---|---|---|---|
+| any close past the averages (Part 9) | 47% / 30% | 40% / 35% | 49% / 39.4% | 47% / 38.7% |
+| **2 ATR beyond the level only** | **38% / 29%** | **30% / 33%** | **40% / 38.9%** | **38% / 38.4%** |
+| past the averages by 0.5 ATR | 45% / 30% | 35% / 34% | 46% / 39.1% | 44% / 38.5% |
+| past the averages by 1.0 ATR | 42% / 30% | 31% / 33% | 43% / 39.1% | 41% / 38.6% |
+
+Breakout + Pullback with the "2 ATR only" rule, against the Part 9 rule: spot gold PF
+1.41 / 1.33 / 1.54 (+49R / +22R / +25R) against 1.43 / 1.33 / 1.49 (+50R / +22R / +23R);
+cash indices 9.9 against 9.6 R a year in 2000–15 and −2.3 against −2.6 in 2016–26;
+futures basket 6.8 against 7.7 in 2000–15 and 3.0 against 1.8 in 2016–26. Adopted by the
+rule set before running (fewer wrong reversals, no more wrong resumptions, trading at
+least as good on the clean set). A close past the trend averages now only delays the
+RESUMED signal until they agree again. On the 11 September chart the 16:45 REVERSAL
+becomes RESUMED at 18:00 (close 4,347.01); the two real reversals that day stay
+reversals, confirmed one bar later. The Pine version matched an independent replay with
+0 mismatches in Breakout and Breakout + Pullback modes. Script: `research/qtrend.py`.
+
+The labels also did not say which way a pullback pointed: RESUMED was green even when it
+ended a bounce inside a downtrend. They now name it. A failed breakout up is "LONG
+pullback?" (a dip in an uptrend) and a failed breakout down is "SHORT pullback?" (a bounce
+in a downtrend). The watch ends with "LONG pullback" or "SHORT pullback" and RESUMED or
+REVERSAL, shown green below the bar when price is heading up and red above it when heading
+down. The level dots are teal for long and maroon for short. This is a display change
+only: on 6,902 15-minute gold bars every plotted value and all 502 labels sat where
+the previous version put them, with each label's direction matching the watch that
+produced it.
 
 ## What to expect if you trade it
 
@@ -381,5 +423,6 @@ identical to the previous version in Breakout mode. Script: `research/qpull.py`.
 - `research/qretest.py` — the retest test in Part 7.
 - `research/qfail.py` — the failed-breakout test in Part 8.
 - `research/qpull.py` — the pullback re-entry test in Part 9.
+- `research/qtrend.py` — the REVERSAL label check in Part 10.
 - `research/` — data layer, structure detection, backtest engine, diagnostics.
 - `data/` and the run outputs are not committed; the scripts regenerate them.

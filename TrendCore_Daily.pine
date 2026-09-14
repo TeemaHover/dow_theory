@@ -37,13 +37,27 @@
 // never look back are the big ones.
 //
 // A breakout that closes back through its level is usually a pullback, not a
-// reversal: within 10 bars about 59% reclaim the level with the trend intact,
-// and about 35% break further or lose the trend. Trading those failures the
-// other way lost money. Re-entering in the trend direction when the level is
-// reclaimed ("Breakout + Pullback") beat Breakout alone on spot gold in all
-// three periods (PF 1.43 / 1.33 / 1.49 against 1.33 / 1.24 / 1.45) and on a
-// futures basket in both, and tied on stock indices. It adds few trades -
-// about 31 in 51 years on gold - so Breakout stays the default.
+// reversal: within 10 bars about two thirds reclaim the level and under a third
+// close more than 2 ATR beyond it. Trading those failures the other way lost
+// money. Re-entering in the trend direction when the level is reclaimed
+// ("Breakout + Pullback") beat Breakout alone on spot gold in all three periods
+// (PF 1.41 / 1.33 / 1.54 against 1.33 / 1.24 / 1.44) and on stock indices in
+// both, and was mixed on a futures basket. It adds few trades - about 46 in 51
+// years on gold - so Breakout stays the default.
+//
+// A failed breakout is only called a REVERSAL when the close goes more than
+// 2 ATR beyond the level. An earlier version also called it a reversal when a
+// close crossed the trend averages; checked with hindsight, those labels were
+// wrong about half the time, so a close past the averages now just delays the
+// RESUMED signal until they agree again.
+//
+// PULLBACK LABELS. "LONG pullback?" marks a breakout up that closed back below
+// its level: in an uptrend that is usually a dip. "SHORT pullback?" marks a
+// breakout down that closed back above its level: usually a bounce in a
+// downtrend. While the watch runs, dots mark the level, teal for long and maroon
+// for short. It ends with RESUMED (a close back beyond the level with the trend
+// intact), REVERSAL (a close more than 2 ATR the other way), or quietly when the
+// window runs out. Green labels below the bars point up, red ones above point down.
 //
 // TAKE-PROFIT. Every fixed target lowered profit factor, because the edge is in
 // the rare very large winner. 6R costs the least; "Off" measured best.
@@ -73,7 +87,7 @@ allowShort = input.bool(true, "Allow Shorts", group = G_SIG, inline = "s1")
 
 entryType = input.string("Breakout", "Entry Type", group = G_ENT,
      options = ["Breakout", "Retest", "Breakout + Retest", "Breakout + Pullback"],
-     tooltip = "Breakout enters on the close that breaks the channel. Retest waits for price to come back to the broken level and close on the breakout side of it. Breakout + Retest takes whichever comes first while flat. Breakout + Pullback also re-enters, while flat, when a failed breakout reclaims its level with the trend intact. Profit factor on spot gold, 1975-99 / 2000-15 / 2016-26: Breakout 1.33 / 1.24 / 1.45 (+38R / +16R / +22R); Retest 1.50 / 1.18 / 1.49 (+39R / +10R / +20R); Breakout + Retest about the same as Breakout; Breakout + Pullback 1.43 / 1.33 / 1.49 (+50R / +22R / +24R).")
+     tooltip = "Breakout enters on the close that breaks the channel. Retest waits for price to come back to the broken level and close on the breakout side of it. Breakout + Retest takes whichever comes first while flat. Breakout + Pullback also re-enters, while flat, when a failed breakout reclaims its level with the trend intact. Profit factor on spot gold, 1975-99 / 2000-15 / 2016-26: Breakout 1.33 / 1.24 / 1.45 (+38R / +16R / +22R); Retest 1.50 / 1.18 / 1.49 (+39R / +10R / +20R); Breakout + Retest about the same as Breakout; Breakout + Pullback 1.41 / 1.33 / 1.54 (+49R / +22R / +25R).")
 rtWindow = input.int(10, "Retest / Failure Window (bars)", minval = 1, maxval = 100, group = G_ENT,
      tooltip = "How many bars after a breakout a retest can still trigger, and a close back through the level still counts as a failed breakout.")
 rtZone = input.float(0.5, "Retest Zone (x ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = G_ENT,
@@ -84,7 +98,7 @@ rtStopMode = input.string("Stop Loss x ATR from entry", "Retest Stop", group = G
 pbWindow = input.int(10, "Pullback Window (bars)", minval = 1, maxval = 100, group = G_ENT,
      tooltip = "After a failed breakout, how many bars to wait for price to reclaim the level. 10 and 20 tested the same.")
 pbDeep = input.float(2.0, "Reversal Beyond Level (x ATR)", minval = 0.5, maxval = 10.0, step = 0.5, group = G_ENT,
-     tooltip = "A failed breakout that closes this many ATRs beyond its level, or loses the trend filters, is treated as a reversal instead of a pullback.")
+     tooltip = "A failed breakout that closes this many ATRs beyond its level is treated as a reversal instead of a pullback. A close past the trend averages does not count as a reversal: checked with hindsight, those calls were wrong about half the time.")
 
 usePrimary = input.bool(true, "Primary Trend Filter", group = G_DOW,
      tooltip = "Dow's primary trend: longs only above the long-term average, shorts only below.")
@@ -115,7 +129,8 @@ showLevels  = input.bool(true, "Show Stop, Target and Entry Lines", group = G_VI
 showChan    = input.bool(true, "Show Breakout Channel", group = G_VIS)
 showPrimary = input.bool(true, "Show Primary Trend Line", group = G_VIS)
 showRetest  = input.bool(true, "Show Retest Level While Waiting", group = G_VIS)
-showPullback = input.bool(true, "Show Failed Breakouts and Pullbacks", group = G_VIS)
+showPullback = input.bool(true, "Show Failed Breakouts and Pullbacks", group = G_VIS,
+     tooltip = "LONG pullback? is a breakout up that closed back below its level, usually a dip in an uptrend. SHORT pullback? is a breakout down that closed back above its level, usually a bounce in a downtrend. Teal dots mark the level a long pullback has to close back above, maroon dots the level a short pullback has to close back below. RESUMED means it did with the trend intact, REVERSAL means price went more than the reversal distance the other way.")
 showLabels  = input.bool(true, "Show Entry and Exit Labels", group = G_VIS)
 showPanel   = input.bool(true, "Show Info Panel", group = G_VIS)
 panelPos    = input.string("Top Right", "Panel Position", group = G_VIS,
@@ -260,9 +275,9 @@ if rtOn
 // ── failed breakout -> pullback ─────────────────────────────────────────────
 // A close back through a broken level within the window is a failed breakout,
 // watched as a pullback in the original direction. Reclaiming the level with the
-// trend intact means the trend resumed; closing more than pbDeep ATRs beyond the
-// level, or losing the trend filters, means a reversal. Also independent of any
-// open trade.
+// trend filters passing means the trend resumed; closing more than pbDeep ATRs
+// beyond the level means a reversal. A close past the trend averages only delays
+// the resumed signal. Also independent of any open trade.
 bool detOn = pbOn or showPullback
 
 var float fwLevel = na
@@ -272,6 +287,7 @@ var float pbLevel = na
 var int   pbDir   = 0
 var int   pbAge   = 0
 int    pbWas     = pbDir
+float  pbWasLvl  = pbLevel
 bool   pbLong    = false
 bool   pbShort   = false
 bool   failedNow = false
@@ -281,18 +297,18 @@ if detOn and pbDir != 0
     pbAge += 1
     if atr > 0
         if pbDir == 1
-            if close < pbLevel - pbDeep * atr or not (trendUp and primUp and avgLong)
+            if close < pbLevel - pbDeep * atr
                 pbEvent := "REVERSAL"
                 pbDir := 0
-            else if close > pbLevel
+            else if close > pbLevel and trendUp and primUp and avgLong
                 pbLong := true
                 pbEvent := "RESUMED"
                 pbDir := 0
         else
-            if close > pbLevel + pbDeep * atr or not (trendDn and primDn and avgShort)
+            if close > pbLevel + pbDeep * atr
                 pbEvent := "REVERSAL"
                 pbDir := 0
-            else if close < pbLevel
+            else if close < pbLevel and trendDn and primDn and avgShort
                 pbShort := true
                 pbEvent := "RESUMED"
                 pbDir := 0
@@ -415,7 +431,8 @@ plot(showLevels and pos != 0 ? entryPx : na, "Entry", color = color.new(color.bl
 plot(showRetest and rtOn and rtDir != 0 ? rtLevel : na, "Retest Level",
      color = color.new(color.purple, 10), style = plot.style_linebr, linewidth = 2)
 plot(showPullback and pbDir != 0 ? pbLevel : na, "Pullback Level",
-     color = color.new(#ff5722, 0), style = plot.style_circles, linewidth = 2)
+     color = pbDir == 1 ? color.new(color.teal, 0) : color.new(color.maroon, 0),
+     style = plot.style_circles, linewidth = 2)
 
 string entryTag = isRetest ? " (retest)" : isPullback ? " (pullback)" : ""
 if showLabels and goLong
@@ -437,15 +454,40 @@ if showLabels and (exitLong or exitShort)
          style = exitLong ? label.style_label_up : label.style_label_down,
          color = closedR >= 0 ? color.new(color.teal, 25) : color.new(color.gray, 25),
          textcolor = color.white, size = size.tiny)
+// A pullback is named after the trade it could lead to: a failed breakout up is a
+// LONG pullback (a dip), a failed breakout down a SHORT pullback (a bounce). The
+// ending label is placed and coloured by where price went: green below the bar
+// when it points up, red above the bar when it points down.
 if showPullback and failedNow
-    label.new(bar_index, pbDir == 1 ? low : high, "FAILED - pullback?",
-         style = pbDir == 1 ? label.style_label_up : label.style_label_down,
-         color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
-if showPullback and pbEvent != ""
-    label.new(bar_index, pbWas == 1 ? low : high, pbEvent,
-         style = pbWas == 1 ? label.style_label_up : label.style_label_down,
-         color = pbEvent == "RESUMED" ? color.new(color.green, 20) : color.new(color.red, 20),
-         textcolor = color.white, size = size.tiny)
+    bool   pbUp = pbDir == 1
+    string lvl  = str.tostring(pbLevel, format.mintick)
+    label.new(bar_index, pbUp ? low : high, pbUp ? "LONG pullback?" : "SHORT pullback?",
+         style = pbUp ? label.style_label_up : label.style_label_down,
+         color = pbUp ? color.new(color.teal, 35) : color.new(color.maroon, 35),
+         textcolor = color.white, size = size.tiny,
+         tooltip = (pbUp ? "The breakout up failed: price closed back below " : "The breakout down failed: price closed back above ") +
+             lvl + (pbUp ? ". In an uptrend this is usually a dip." : ". In a downtrend this is usually a bounce.") +
+             "\nRESUMED if, within " + str.tostring(pbWindow) + " bars, a close gets back " + (pbUp ? "above " : "below ") +
+             lvl + " with the trend filters passing." +
+             "\nREVERSAL if a close goes more than " + str.tostring(pbDeep) + " ATR " + (pbUp ? "below" : "above") +
+             " it (about " + str.tostring(pbUp ? pbLevel - pbDeep * atr : pbLevel + pbDeep * atr, format.mintick) + " now).")
+// a pullback entry already gets its own "(pullback)" label on this bar
+if showPullback and pbEvent != "" and not (showLabels and isPullback)
+    bool   wasUp   = pbWas == 1
+    bool   resumed = pbEvent == "RESUMED"
+    bool   upward  = wasUp == resumed
+    string lvl     = str.tostring(pbWasLvl, format.mintick)
+    string tip     = "Price closed more than " + str.tostring(pbDeep) + " ATR " + (wasUp ? "below " : "above ") + lvl +
+         ": treated as a reversal, not a " + (wasUp ? "dip." : "bounce.")
+    if resumed
+        tip := "Price closed back " + (wasUp ? "above " : "below ") + lvl + " with the trend filters passing: the " +
+             (wasUp ? "dip is over and the uptrend resumed." : "bounce is over and the downtrend resumed.") +
+             " Breakout + Pullback takes this as a " + (wasUp ? "long" : "short") + " entry when flat."
+    label.new(bar_index, upward ? low : high,
+         (wasUp ? "LONG" : "SHORT") + " pullback\n" + pbEvent + (upward ? " ▲" : " ▼"),
+         style = upward ? label.style_label_up : label.style_label_down,
+         color = upward ? color.new(color.green, 20) : color.new(color.red, 20),
+         textcolor = color.white, size = size.tiny, tooltip = tip)
 
 // ── panel ───────────────────────────────────────────────────────────────────
 f_panelPos() =>
@@ -479,8 +521,9 @@ if showPanel and barstate.islast
          (rtDir == 1 ? "long" : "short") + " @ " + str.tostring(rtLevel, format.mintick) +
          " (" + str.tostring(rtWindow - rtAge) + " bars)", not rtOn or rtDir == 0 ? color.gray : color.fuchsia)
     f_row(8, "Pullback", not detOn ? "off" : pbDir == 0 ? "none" :
-         (pbDir == 1 ? "long" : "short") + " @ " + str.tostring(pbLevel, format.mintick) +
-         " (" + str.tostring(pbWindow - pbAge) + " bars)", pbDir == 0 ? color.gray : color.orange)
+         (pbDir == 1 ? "LONG, close above " : "SHORT, close below ") + str.tostring(pbLevel, format.mintick) +
+         " (" + str.tostring(pbWindow - pbAge) + " bars)",
+         pbDir == 0 ? color.gray : pbDir == 1 ? color.lime : color.red)
     f_row(9, "Trend / Primary", (close > ema ? "up" : "down") + " / " + (not usePrimary ? "off" :
          na(prim) ? "n/a" : close > prim ? "up" : "down"),
          close > ema and (not usePrimary or (not na(prim) and close > prim)) ? color.lime :

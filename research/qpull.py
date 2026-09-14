@@ -35,9 +35,30 @@ OUTCOMES = []
 
 
 def simulate(s, mode="breakout", W=10, W2=10, trig="reclaim", pstop="swing", deep=2.0,
-             tp_r=6.0, collect=False):
+             tp_r=6.0, collect=False, trend_cancel="close", margin=0.0):
+    """trend_cancel: "close" ends the pullback as a reversal on any close past the trend
+    filters (original rule); "none" never does, it only waits for them to pass again;
+    "margin" does so only when the close is at least `margin` ATR past the EMA or SMA."""
     idx, o, h, l, c, a, hh, ll, fl, fs, ok, brkL, brkS = F.arrays(s)
     n = len(c)
+    ema100 = F.ema(c, 100)
+    sma250 = pd.Series(c).rolling(250, min_periods=250).mean().to_numpy()
+
+    def breach(j, d):
+        if not ok[j] or not np.isfinite(sma250[j]):
+            return 0.0
+        if d == 1:
+            return max(ema100[j] - c[j], sma250[j] - c[j]) / a[j]
+        return max(c[j] - ema100[j], c[j] - sma250[j]) / a[j]
+
+    def trend_broken(j, d, filt_ok):
+        if filt_ok:
+            return False
+        if trend_cancel == "close":
+            return True
+        if trend_cancel == "none":
+            return False
+        return breach(j, d) >= margin
     half_bps = Q.COST_BPS.get(s, 5) / 1e4 / 2.0
     trades = []
     pos, entry, stop, risk, tgt, e_i, half, tag = 0, np.nan, np.nan, np.nan, np.nan, -1, 0.0, ""
@@ -94,8 +115,10 @@ def simulate(s, mode="breakout", W=10, W2=10, trig="reclaim", pstop="swing", dee
             elif pbdir == 1:
                 if deep is not None and c[j] < pbP - deep * a[j]:
                     end_pullback("reversal: fell > %.0f ATR" % deep)
-                elif not fl[j]:
+                elif trend_broken(j, 1, fl[j]):
                     end_pullback("reversal: trend filter broke")
+                elif not fl[j]:
+                    pass
                 elif (trig == "reclaim" and c[j] > pbP) or (trig == "turn" and j > 0 and c[j] > h[j - 1]):
                     pb = 1
                     pb_stop = pbExt - 0.25 * a[j] if pstop == "swing" else c[j] - 2 * a[j]
@@ -103,8 +126,10 @@ def simulate(s, mode="breakout", W=10, W2=10, trig="reclaim", pstop="swing", dee
             else:
                 if deep is not None and c[j] > pbP + deep * a[j]:
                     end_pullback("reversal: fell > %.0f ATR" % deep)
-                elif not fs[j]:
+                elif trend_broken(j, -1, fs[j]):
                     end_pullback("reversal: trend filter broke")
+                elif not fs[j]:
+                    pass
                 elif (trig == "reclaim" and c[j] < pbP) or (trig == "turn" and j > 0 and c[j] < l[j - 1]):
                     pb = -1
                     pb_stop = pbExt + 0.25 * a[j] if pstop == "swing" else c[j] + 2 * a[j]
