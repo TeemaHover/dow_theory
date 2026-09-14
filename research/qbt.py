@@ -15,7 +15,7 @@ import pandas as pd
 def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
         atr_col=None, features=None, allow_pyramid=False, exit_on_close=False,
         trail_l=None, trail_s=None, tp_full_r=None, tp1_r=None, tp1_frac=0.5,
-        be_after_tp1=False):
+        be_after_tp1=False, gap_fills=False, reenter_on_exit_bar=False):
     """Simulate. `entries` needs columns dir/stop/target (dir 0 means no signal)."""
     o = work["open"].to_numpy(np.float64)
     h = work["high"].to_numpy(np.float64)
@@ -82,7 +82,11 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                     hit_stop = (l[j] <= stop) if d > 0 else (h[j] >= stop)
                 hit_tgt = (h[j] >= tgt0) if d > 0 else (l[j] <= tgt0)
                 if hit_stop:                       # stop wins ties, deliberately
-                    exit_i, exit_px, reason = j, stop, "stop"
+                    px = stop
+                    # a bar that OPENS beyond the stop cannot fill at the stop
+                    if gap_fills and ((o[j] < stop) if d > 0 else (o[j] > stop)):
+                        px = o[j]
+                    exit_i, exit_px, reason = j, px, "stop"
                     break
                 # partial take-profit: bank a fraction at TP1, let the rest keep trailing
                 if tp1_r is not None and not tp1_done:
@@ -93,7 +97,10 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                         if be_after_tp1:
                             stop = max(stop, entry) if d > 0 else min(stop, entry)
                 if hit_tgt:
-                    exit_i, exit_px, reason = j, tgt0, "target"
+                    px = tgt0
+                    if gap_fills and ((o[j] > tgt0) if d > 0 else (o[j] < tgt0)):
+                        px = o[j]
+                    exit_i, exit_px, reason = j, px, "target"
                     break
                 if be_at_r is not None and not moved_be and fav / risk >= be_at_r:
                     stop = entry
@@ -119,7 +126,7 @@ def run(work, entries, spread=0.0, max_bars=200, be_at_r=None, trail_atr=None,
                 for k in features.columns:
                     rec["f_" + k] = features[k].iloc[i]
             rows.append(rec)
-            i = exit_i if allow_pyramid else exit_i + 1
+            i = exit_i if (allow_pyramid or reenter_on_exit_bar) else exit_i + 1
         else:
             i += 1
     return pd.DataFrame(rows)
